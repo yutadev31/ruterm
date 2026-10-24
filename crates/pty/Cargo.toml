@@ -1,0 +1,9 @@
+[package]
+name = "pty"
+version = "0.1.0"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+nix = { version = "0.31.3", features = ["fs", "ioctl", "process", "term"] }
