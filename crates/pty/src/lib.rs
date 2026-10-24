@@ -1,17 +1,14 @@
 use std::fs::File;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
-use std::{
-    collections::HashMap,
-    ffi::{CStr, CString},
-    io,
-    os::fd::AsRawFd,
-    path::PathBuf,
-};
+use std::{collections::HashMap, ffi::CString, io, os::fd::AsRawFd, path::PathBuf};
 
+use nix::errno::Errno;
+use nix::fcntl::OFlag;
+use nix::libc::_exit;
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-#[cfg(unix)]
-use nix::unistd::Pid;
+use nix::unistd::chdir;
+use nix::unistd::{Pid, pipe2};
 use nix::{
     libc::{TIOCSCTTY, ioctl},
     pty::{Winsize, openpty},
@@ -19,13 +16,8 @@ use nix::{
 };
 
 pub struct Pty {
-    #[cfg(unix)]
     master: File,
-
-    #[cfg(unix)]
     pid: Pid,
-
-    #[cfg(unix)]
     status: Option<ExitStatus>,
 }
 
@@ -56,42 +48,69 @@ impl Pty {
 
         let pty = openpty(&winsize, None)?;
 
-        let program = &CString::new(options.program).unwrap();
+        let program = CString::new(options.program.as_str())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-        let args: Vec<CString> = options
-            .args
-            .iter()
-            .map(|arg| CString::new(arg.as_str()).unwrap())
-            .collect();
-        let args: Vec<&CStr> = args.iter().map(|arg| arg.as_c_str()).collect();
+        let mut args = Vec::with_capacity(options.args.len() + 1);
+
+        args.push(
+            CString::new(options.program.clone())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
+        );
+
+        for arg in &options.args {
+            args.push(
+                CString::new(arg.as_str())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
+            );
+        }
+
+        let (error_read, error_write) = pipe2(OFlag::O_CLOEXEC)?;
 
         match unsafe { fork()? } {
             nix::unistd::ForkResult::Parent { child } => {
                 drop(pty.slave);
-                return Ok(Self {
+                Ok(Self {
                     master: File::from(pty.master),
                     pid: child,
                     status: None,
-                });
+                })
             }
             nix::unistd::ForkResult::Child => {
                 drop(pty.master);
                 let slave = pty.slave;
 
-                setsid()?;
-
-                if unsafe { ioctl(slave.as_raw_fd(), TIOCSCTTY, 0) } == -1 {
-                    return Err(io::Error::last_os_error());
+                drop(error_read);
+                if let Err(errno) = setsid() {
+                    child_error(&error_write, errno);
                 }
 
-                dup2_stdin(&slave)?;
-                dup2_stdout(&slave)?;
-                dup2_stderr(&slave)?;
+                if unsafe { ioctl(slave.as_raw_fd(), TIOCSCTTY, 0) } == -1 {
+                    child_error(&error_write, Errno::last());
+                }
+
+                if let Err(errno) = dup2_stdin(&slave) {
+                    child_error(&error_write, errno);
+                }
+
+                if let Err(errno) = dup2_stdout(&slave) {
+                    child_error(&error_write, errno);
+                }
+
+                if let Err(errno) = dup2_stderr(&slave) {
+                    child_error(&error_write, errno);
+                }
+
+                if let Some(cwd) = &options.cwd
+                    && let Err(errno) = chdir(cwd)
+                {
+                    child_error(&error_write, errno);
+                }
 
                 drop(slave);
 
-                execvp(program, &args)?;
-                unreachable!();
+                let Err(errno) = execvp(&program, &args);
+                child_error(&error_write, errno);
             }
         }
     }
@@ -124,5 +143,15 @@ impl Pty {
 
         self.status = Some(status);
         Ok(Some(status))
+    }
+}
+
+fn child_error(fd: &impl std::os::fd::AsFd, errno: Errno) -> ! {
+    let value = (errno as i32).to_ne_bytes();
+
+    let _ = nix::unistd::write(fd, &value);
+
+    unsafe {
+        _exit(127);
     }
 }
