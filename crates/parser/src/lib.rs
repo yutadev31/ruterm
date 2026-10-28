@@ -47,7 +47,7 @@ enum State {
     OscEscape,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Parser {
     state: State,
     utf8: Utf8Decoder,
@@ -57,16 +57,6 @@ pub struct Parser {
 }
 
 impl Parser {
-    pub fn new() -> Self {
-        Self {
-            state: State::default(),
-            utf8: Utf8Decoder::default(),
-            esc: EscParser::default(),
-            csi: CsiParser::default(),
-            osc: OscParser::default(),
-        }
-    }
-
     pub fn advance<F>(&mut self, bytes: &[u8], mut callback: F)
     where
         F: FnMut(Action),
@@ -269,11 +259,7 @@ impl Parser {
     fn finish_osc(&mut self) -> Option<Action> {
         self.state = State::Ground;
 
-        if let Some(osc) = self.osc.build() {
-            Some(Action::Osc(osc))
-        } else {
-            None
-        }
+        self.osc.build().map(Action::Osc)
     }
 }
 
@@ -412,7 +398,7 @@ mod tests {
     fn parse(input: &[u8]) -> Vec<Action> {
         ACTIONS.with(|actions| actions.borrow_mut().clear());
 
-        let mut parser = Parser::new();
+        let mut parser = Parser::default();
         parser.advance(input, callback);
 
         ACTIONS.with(|actions| actions.borrow().clone())
