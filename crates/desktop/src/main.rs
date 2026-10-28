@@ -81,10 +81,10 @@ impl Gpu {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode: wgpu::PresentMode::AutoNoVsync,
             alpha_mode: capabilities.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: 1,
         };
         if size.width > 0 && size.height > 0 {
             surface.configure(&device, &config);
@@ -311,6 +311,7 @@ struct App {
     clipboard: Option<arboard::Clipboard>,
     last_frame: Option<Instant>,
     output_redraw_pending: bool,
+    input_redraw_pending: bool,
 }
 
 impl App {
@@ -337,6 +338,7 @@ impl App {
             clipboard: None,
             last_frame: None,
             output_redraw_pending: false,
+            input_redraw_pending: false,
         }
     }
 
@@ -470,10 +472,12 @@ impl App {
     }
 
     fn send_input(&mut self, bytes: Vec<u8>) {
-        if let Some(input) = &self.input
-            && input.send(bytes).is_err()
-        {
-            self.message("PTY writer stopped");
+        if let Some(input) = &self.input {
+            if input.send(bytes).is_err() {
+                self.message("PTY writer stopped");
+            } else {
+                self.input_redraw_pending = true;
+            }
         }
     }
 
@@ -787,7 +791,15 @@ impl ApplicationHandler<UserEvent> for App {
                         .min(self.terminal.screen.scrollback.len());
                 }
                 self.update_ime_area();
-                self.output_redraw_pending = true;
+                if self.input_redraw_pending {
+                    self.input_redraw_pending = false;
+                    self.output_redraw_pending = false;
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                } else {
+                    self.output_redraw_pending = true;
+                }
                 let _ = ack.send(());
             }
             UserEvent::End(error) if !self.ended => {
