@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/parser", "crates/pty"]
+members = ["crates/core", "crates/desktop", "crates/parser", "crates/pty"]
 
 [workspace.package]
 edition = "2024"
@@ -8,7 +8,14 @@ repository = "https://github.com/yutadev31/ruterm.git"
 license = "MIT"
 
 [workspace.dependencies]
+ab_glyph = "0.2.32"
+arboard = "3.7.0"
 bitflags = "2.13.2"
+futures-lite = "2.6.1"
 nix = "0.31.3"
+ruterm-core.path = "crates/core"
 ruterm-parser.path = "crates/parser"
 ruterm-pty.path = "crates/pty"
+unicode-width = "0.2.2"
+wgpu = "24.0.5"
+winit = "0.30.13"

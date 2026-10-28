@@ -1,0 +1,16 @@
+[package]
+name = "ruterm-desktop"
+version = "0.1.0"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+ab_glyph.workspace = true
+arboard = { workspace = true, default-features = false, features = ["wayland-data-control"] }
+futures-lite.workspace = true
+ruterm-core.workspace = true
+ruterm-parser.workspace = true
+ruterm-pty.workspace = true
+wgpu.workspace = true
+winit.workspace = true

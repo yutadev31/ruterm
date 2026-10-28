@@ -34,6 +34,9 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Install Linux GUI build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libvulkan-dev libfontconfig1-dev
+
       - name: Check formatting
         run: cargo fmt --all --check
 

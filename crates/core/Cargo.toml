@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 bitflags.workspace = true
 ruterm-parser.workspace = true
+unicode-width.workspace = true

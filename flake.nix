@@ -36,9 +36,16 @@
         ];
 
         nativeBuildInputs = with pkgs; [
+          pkg-config
+          makeWrapper
         ];
 
         buildInputs = with pkgs; [
+          wayland
+          libxkbcommon
+          libGL
+          vulkan-loader
+          fontconfig
         ];
 
         ruterm = pkgs.rustPlatform.buildRustPackage {
@@ -49,6 +56,9 @@
           cargoLock.lockFile = ./Cargo.lock;
 
           inherit nativeBuildInputs buildInputs;
+          postInstall = ''
+            wrapProgram $out/bin/ruterm-desktop --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.fontconfig ]}
+          '';
         };
       in
       {

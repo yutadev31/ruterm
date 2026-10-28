@@ -1,9 +1,10 @@
 use ruterm_parser::{Action, Csi, Esc, Osc};
+use unicode_width::UnicodeWidthChar;
 
 use crate::{
     attributes::{Attributes, Color, Flags, UnderlineStyle},
     common::Position,
-    screen::{Cell, Screen},
+    screen::{Cell, Screen, clone_within},
 };
 
 #[derive(Debug)]
@@ -40,11 +41,53 @@ impl Terminal {
         }
     }
 
+    pub fn resize(&mut self, rows: usize, cols: usize) {
+        let old_cols = self.tab_stops.len();
+        self.screen.resize(rows, cols);
+        self.cursor.position.row = self.cursor.position.row.min(rows.saturating_sub(1));
+        self.cursor.position.col = self.cursor.position.col.min(cols.saturating_sub(1));
+        self.cursor.pending_wrap = false;
+        self.tab_stops.resize(cols, false);
+        for col in old_cols..cols {
+            if col != 0 && col % 8 == 0 {
+                self.tab_stops[col] = true;
+            }
+        }
+        if let Some((position, _)) = &mut self.saved_cursor {
+            position.row = position.row.min(rows.saturating_sub(1));
+            position.col = position.col.min(cols.saturating_sub(1));
+        }
+    }
+
     fn print(&mut self, ch: char) {
         if self.screen.rows() == 0 || self.screen.cols() == 0 {
             return;
         }
+        let width = UnicodeWidthChar::width(ch)
+            .unwrap_or(0)
+            .min(self.screen.cols());
+        if width == 0 {
+            let mut col = if self.cursor.pending_wrap {
+                self.cursor.position.col
+            } else {
+                self.cursor.position.col.saturating_sub(1)
+            };
+            if col > 0
+                && self.screen.cells[self.cursor.position.row * self.screen.cols() + col]
+                    .wide_continuation
+            {
+                col -= 1;
+            }
+            let index = self.cursor.position.row * self.screen.cols() + col;
+            if let Some(cell) = self.screen.cells.get_mut(index) {
+                cell.combining.push(ch);
+            }
+            return;
+        }
         if self.cursor.pending_wrap {
+            self.wrap_line();
+        }
+        if width == 2 && self.cursor.position.col + 1 >= self.screen.cols() {
             self.wrap_line();
         }
         let row = self.cursor.position.row.min(self.screen.rows() - 1);
@@ -55,13 +98,27 @@ impl Terminal {
             col,
             Cell {
                 ch,
+                combining: String::new(),
+                wide_continuation: false,
                 attrs: self.attrs,
             },
         );
-        if col + 1 == self.screen.cols() {
+        if width == 2 {
+            self.screen.set_cell(
+                row,
+                col + 1,
+                Cell {
+                    ch: ' ',
+                    combining: String::new(),
+                    wide_continuation: true,
+                    attrs: self.attrs,
+                },
+            );
+        }
+        if col + width >= self.screen.cols() {
             self.cursor.pending_wrap = true;
         } else {
-            self.cursor.position.col += 1;
+            self.cursor.position.col += width;
         }
     }
 
@@ -327,6 +384,8 @@ impl Terminal {
         if start < end {
             self.screen.cells[start..end].fill(Cell {
                 ch: ' ',
+                combining: String::new(),
+                wide_continuation: false,
                 attrs: self.attrs,
             });
         }
@@ -345,7 +404,7 @@ impl Terminal {
             return;
         }
         let n = count.min(end - start);
-        self.screen.cells.copy_within(start..end - n, start + n);
+        clone_within(&mut self.screen.cells, start..end - n, start + n);
         self.erase_range(start, start + n);
     }
 
@@ -362,7 +421,7 @@ impl Terminal {
             return;
         }
         let n = count.min(end - start);
-        self.screen.cells.copy_within(start + n..end, start);
+        clone_within(&mut self.screen.cells, start + n..end, start);
         self.erase_range(end - n, end);
     }
 
@@ -374,7 +433,7 @@ impl Terminal {
             return;
         }
         let n = count.min(self.screen.rows() - self.cursor.position.row) * cols;
-        self.screen.cells.copy_within(start..end - n, start + n);
+        clone_within(&mut self.screen.cells, start..end - n, start + n);
         self.erase_range(start, start + n);
     }
 
@@ -386,7 +445,7 @@ impl Terminal {
             return;
         }
         let n = count.min(self.screen.rows() - self.cursor.position.row) * cols;
-        self.screen.cells.copy_within(start + n..end, start);
+        clone_within(&mut self.screen.cells, start + n..end, start);
         self.erase_range(end - n, end);
     }
 
@@ -505,7 +564,7 @@ mod tests {
     fn handles_sgr_colors_and_reset() {
         let mut terminal = Terminal::new(1, 4);
         feed(&mut terminal, b"\x1b[1;38;2;12;34;56;48;5;123mA\x1b[0mB");
-        let first = terminal.screen.cells[0];
+        let first = terminal.screen.cells[0].clone();
         assert_eq!(first.attrs.fg, Color::Rgb(12, 34, 56));
         assert_eq!(first.attrs.bg, Color::Indexed(123));
         assert!(first.attrs.flags.contains(Flags::BOLD));
@@ -546,5 +605,43 @@ mod tests {
         let mut terminal = Terminal::new(0, 0);
         feed(&mut terminal, b"abc\n\x1b[2J\x1bc");
         assert!(terminal.screen.cells.is_empty());
+    }
+
+    #[test]
+    fn resize_preserves_visible_content_and_cursor() {
+        let mut terminal = Terminal::new(2, 4);
+        feed(&mut terminal, b"abc\x1b[2;4H!");
+        terminal.resize(3, 5);
+        assert_eq!(row(&terminal, 0), "abc  ");
+        assert_eq!(terminal.screen.cells[8].ch, '!');
+        assert_eq!(terminal.cursor.position, Position { row: 1, col: 3 });
+        terminal.resize(1, 2);
+        assert_eq!(row(&terminal, 0), "ab");
+        assert_eq!(terminal.cursor.position, Position { row: 0, col: 1 });
+    }
+
+    #[test]
+    fn wide_and_combining_characters_use_expected_cells() {
+        let mut terminal = Terminal::new(2, 4);
+        feed(&mut terminal, "日e\u{301}".as_bytes());
+        assert_eq!(terminal.screen.cells[0].ch, '日');
+        assert!(terminal.screen.cells[1].wide_continuation);
+        assert_eq!(terminal.screen.cells[2].ch, 'e');
+        assert_eq!(terminal.screen.cells[2].combining, "\u{301}");
+        assert_eq!(terminal.cursor.position.col, 3);
+        let mut terminal = Terminal::new(2, 1);
+        feed(&mut terminal, "a\u{301}".as_bytes());
+        assert_eq!(terminal.screen.cells[0].combining, "\u{301}");
+        assert_eq!(terminal.cursor.position.row, 0);
+    }
+
+    #[test]
+    fn scrollback_keeps_scrolled_lines() {
+        let mut terminal = Terminal::new(2, 2);
+        feed(&mut terminal, b"aa\r\nbb\r\ncc");
+        assert_eq!(terminal.screen.scrollback.len(), 1);
+        let view = terminal.screen.view_cells(1);
+        assert_eq!(view[0].ch, 'a');
+        assert_eq!(view[2].ch, 'b');
     }
 }
