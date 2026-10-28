@@ -1,8 +1,11 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::mpsc::{self, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use ab_glyph::{Font, FontVec, PxScale, point};
 use ruterm_core::attributes::{Color, Flags};
@@ -22,9 +25,11 @@ const CELL_W: usize = 10;
 const CELL_H: usize = 20;
 const WIDTH: u32 = (COLS * CELL_W) as u32;
 const HEIGHT: u32 = (ROWS * CELL_H) as u32;
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 enum UserEvent {
-    Output(Vec<u8>),
+    Output(Vec<u8>, Sender<()>),
+    WriteError(String),
     End(String),
 }
 
@@ -292,6 +297,7 @@ struct App {
     terminal: Terminal,
     parser: Parser,
     pty: Option<Pty>,
+    input: Option<Sender<Vec<u8>>>,
     proxy: EventLoopProxy<UserEvent>,
     modifiers: ModifiersState,
     ended: bool,
@@ -302,6 +308,8 @@ struct App {
     dragging: bool,
     mouse_cell: usize,
     clipboard: Option<arboard::Clipboard>,
+    last_frame: Option<Instant>,
+    output_redraw_pending: bool,
 }
 
 impl App {
@@ -314,6 +322,7 @@ impl App {
             terminal: Terminal::new(ROWS, COLS),
             parser: Parser::default(),
             pty: None,
+            input: None,
             proxy,
             modifiers: ModifiersState::empty(),
             ended: false,
@@ -324,6 +333,8 @@ impl App {
             dragging: false,
             mouse_cell: 0,
             clipboard: None,
+            last_frame: None,
+            output_redraw_pending: false,
         }
     }
 
@@ -359,13 +370,18 @@ impl App {
                     let proxy = self.proxy.clone();
                     thread::spawn(move || {
                         let mut buffer = [0; 8192];
+                        let (ack, received) = mpsc::channel();
                         loop {
                             match reader.read(&mut buffer) {
                                 Ok(0) => break,
                                 Ok(n) => {
                                     if proxy
-                                        .send_event(UserEvent::Output(buffer[..n].to_vec()))
+                                        .send_event(UserEvent::Output(
+                                            buffer[..n].to_vec(),
+                                            ack.clone(),
+                                        ))
                                         .is_err()
+                                        || received.recv().is_err()
                                     {
                                         return;
                                     }
@@ -384,7 +400,25 @@ impl App {
                         }
                         let _ = proxy.send_event(UserEvent::End(String::new()));
                     });
-                    self.pty = Some(pty);
+                    match pty.clone_reader() {
+                        Ok(mut writer) => {
+                            let (sender, receiver) = mpsc::channel::<Vec<u8>>();
+                            let proxy = self.proxy.clone();
+                            thread::spawn(move || {
+                                for bytes in receiver {
+                                    if let Err(error) = writer.write_all(&bytes) {
+                                        let _ = proxy.send_event(UserEvent::WriteError(format!(
+                                            "PTY write error: {error}"
+                                        )));
+                                        break;
+                                    }
+                                }
+                            });
+                            self.input = Some(sender);
+                            self.pty = Some(pty);
+                        }
+                        Err(error) => self.message(&format!("Cannot write PTY: {error}")),
+                    }
                 }
                 Err(error) => self.message(&format!("Cannot read PTY: {error}")),
             },
@@ -417,11 +451,16 @@ impl App {
             }
             _ => Vec::new(),
         };
-        if let Some(pty) = &mut self.pty
-            && !bytes.is_empty()
-            && let Err(error) = pty.writer().write_all(&bytes)
+        if !bytes.is_empty() {
+            self.send_input(bytes);
+        }
+    }
+
+    fn send_input(&mut self, bytes: Vec<u8>) {
+        if let Some(input) = &self.input
+            && input.send(bytes).is_err()
         {
-            self.message(&format!("PTY write error: {error}"));
+            self.message("PTY writer stopped");
         }
     }
 
@@ -496,11 +535,7 @@ impl App {
             eprintln!("Clipboard does not contain text");
             return;
         };
-        if let Some(pty) = &mut self.pty
-            && let Err(error) = pty.writer().write_all(text.as_bytes())
-        {
-            self.message(&format!("PTY write error: {error}"));
-        }
+        self.send_input(text.into_bytes());
     }
 }
 
@@ -547,7 +582,26 @@ fn should_forward_key(key: &Key, modifiers: ModifiersState, preedit: &str) -> bo
 }
 
 impl ApplicationHandler<UserEvent> for App {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.output_redraw_pending {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+            return;
+        }
+        let deadline = self
+            .last_frame
+            .map_or_else(Instant::now, |time| time + FRAME_INTERVAL);
+        if Instant::now() >= deadline {
+            self.output_redraw_pending = false;
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        } else {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
+        }
+    }
+
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.input.take();
         if let Some(pty) = &mut self.pty {
             let _ = pty.terminate();
         }
@@ -593,6 +647,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
         match event {
             WindowEvent::CloseRequested => {
+                self.input.take();
                 if let Some(pty) = &mut self.pty {
                     let _ = pty.terminate();
                 }
@@ -659,11 +714,7 @@ impl ApplicationHandler<UserEvent> for App {
                     Ime::Preedit(text, _) => self.preedit = text,
                     Ime::Commit(text) => {
                         self.preedit.clear();
-                        if let Some(pty) = &mut self.pty
-                            && let Err(error) = pty.writer().write_all(text.as_bytes())
-                        {
-                            self.message(&format!("PTY write error: {error}"));
-                        }
+                        self.send_input(text.into_bytes());
                     }
                 }
                 self.window.as_ref().unwrap().request_redraw();
@@ -684,6 +735,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested if self.drawable => {
+                self.last_frame = Some(Instant::now());
                 self.update_ime_area();
                 let pixels = rasterize(
                     &self.terminal,
@@ -711,7 +763,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Output(bytes) => {
+            UserEvent::Output(bytes, ack) => {
                 let old_history = self.terminal.screen.scrollback.len();
                 self.parser
                     .advance(&bytes, |action| self.terminal.process(action));
@@ -728,9 +780,8 @@ impl ApplicationHandler<UserEvent> for App {
                         .min(self.terminal.screen.scrollback.len());
                 }
                 self.update_ime_area();
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
+                self.output_redraw_pending = true;
+                let _ = ack.send(());
             }
             UserEvent::End(error) if !self.ended => {
                 self.ended = true;
@@ -748,6 +799,7 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 self.message(&text);
             }
+            UserEvent::WriteError(error) => self.message(&error),
             _ => {}
         }
     }
@@ -808,7 +860,11 @@ fn rasterize(
     let rows = terminal.screen.rows();
     let width = cols * CELL_W;
     let mut pixels = vec![0; width * rows * CELL_H * 4];
-    let mut cells = terminal.screen.view_cells(scroll_offset);
+    let mut cells: Cow<'_, [ruterm_core::screen::Cell]> = if scroll_offset == 0 {
+        Cow::Borrowed(&terminal.screen.cells)
+    } else {
+        Cow::Owned(terminal.screen.view_cells(scroll_offset))
+    };
     if scroll_offset == 0 && !preedit.is_empty() {
         let row = terminal.cursor.position.row;
         for (col, ch) in (terminal.cursor.position.col..).zip(preedit.chars()) {
@@ -816,7 +872,7 @@ fn rasterize(
                 break;
             }
             let index = row * cols + col;
-            cells[index] = ruterm_core::screen::Cell {
+            cells.to_mut()[index] = ruterm_core::screen::Cell {
                 ch,
                 attrs: ruterm_core::attributes::Attributes {
                     underline: ruterm_core::attributes::UnderlineStyle::Single,
@@ -858,7 +914,7 @@ fn rasterize(
     for row in 0..rows {
         for col in 0..cols {
             let cell = &cells[row * cols + col];
-            if cell.wide_continuation {
+            if cell.wide_continuation || (cell.ch == ' ' && cell.combining.is_empty()) {
                 continue;
             }
             let mut fg = color(cell.attrs.fg, [220, 220, 220]);
