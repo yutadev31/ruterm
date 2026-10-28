@@ -18,7 +18,7 @@ ruterm-core.path = "crates/core"
 ruterm-parser.path = "crates/parser"
 ruterm-pty.path = "crates/pty"
 toml = "0.8.23"
-unicode-width = "0.2.2"
+unicode-width = "0.2.3"
 wgpu = "24.0.5"
 winit = "0.30.13"
 
