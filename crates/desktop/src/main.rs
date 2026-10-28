@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,7 @@ const COLS: usize = 80;
 const ROWS: usize = 24;
 const DEFAULT_FONT_SIZE: f32 = 17.0;
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const OUTPUT_BUFFER_LIMIT: usize = 256 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 struct FontSettings {
@@ -108,7 +109,7 @@ impl CellSize {
             .map(|ch| scaled.h_advance(font.glyph_id(ch)))
             .fold(0.0_f32, f32::max);
         Self {
-            width: advance.ceil().max(1.0) as usize + 2,
+            width: advance.ceil().max(1.0) as usize,
             height: (scaled.ascent() - scaled.descent() + scaled.line_gap())
                 .ceil()
                 .max(size.ceil()) as usize
@@ -118,9 +119,45 @@ impl CellSize {
 }
 
 enum UserEvent {
-    Output(Vec<u8>, Sender<()>),
+    Output,
     WriteError(String),
     End(String),
+}
+
+#[derive(Default)]
+struct OutputBuffer {
+    state: Mutex<OutputState>,
+    space_available: Condvar,
+}
+
+#[derive(Default)]
+struct OutputState {
+    bytes: Vec<u8>,
+    wake_pending: bool,
+}
+
+impl OutputBuffer {
+    fn push(&self, bytes: &[u8]) -> bool {
+        let mut state = self.state.lock().unwrap();
+        while state.bytes.len() >= OUTPUT_BUFFER_LIMIT {
+            state = self.space_available.wait(state).unwrap();
+        }
+        state.bytes.extend_from_slice(bytes);
+        if state.wake_pending {
+            false
+        } else {
+            state.wake_pending = true;
+            true
+        }
+    }
+
+    fn take(&self) -> Vec<u8> {
+        let mut state = self.state.lock().unwrap();
+        state.wake_pending = false;
+        let bytes = std::mem::take(&mut state.bytes);
+        self.space_available.notify_one();
+        bytes
+    }
 }
 
 struct Gpu {
@@ -394,6 +431,7 @@ struct App {
     pty: Option<Pty>,
     input: Option<Sender<Vec<u8>>>,
     proxy: EventLoopProxy<UserEvent>,
+    output: Arc<OutputBuffer>,
     modifiers: ModifiersState,
     ended: bool,
     drawable: bool,
@@ -432,6 +470,7 @@ impl App {
             pty: None,
             input: None,
             proxy,
+            output: Arc::new(OutputBuffer::default()),
             modifiers: ModifiersState::empty(),
             ended: false,
             drawable: true,
@@ -488,20 +527,15 @@ impl App {
             Ok(pty) => match pty.clone_reader() {
                 Ok(mut reader) => {
                     let proxy = self.proxy.clone();
+                    let output = self.output.clone();
                     thread::spawn(move || {
-                        let mut buffer = [0; 8192];
-                        let (ack, received) = mpsc::channel();
+                        let mut buffer = [0; 65536];
                         loop {
                             match reader.read(&mut buffer) {
                                 Ok(0) => break,
                                 Ok(n) => {
-                                    if proxy
-                                        .send_event(UserEvent::Output(
-                                            buffer[..n].to_vec(),
-                                            ack.clone(),
-                                        ))
-                                        .is_err()
-                                        || received.recv().is_err()
+                                    if output.push(&buffer[..n])
+                                        && proxy.send_event(UserEvent::Output).is_err()
                                     {
                                         return;
                                     }
@@ -904,7 +938,8 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Output(bytes, ack) => {
+            UserEvent::Output => {
+                let bytes = self.output.take();
                 let old_history = self.terminal.screen.scrollback.len();
                 self.parser
                     .advance(&bytes, |action| self.terminal.process(action));
@@ -930,7 +965,6 @@ impl ApplicationHandler<UserEvent> for App {
                 } else {
                     self.output_redraw_pending = true;
                 }
-                let _ = ack.send(());
             }
             UserEvent::End(error) if !self.ended => {
                 self.ended = true;
@@ -1278,6 +1312,45 @@ mod tests {
     use super::*;
     use ruterm_core::attributes::{Attributes, Color};
     use ruterm_core::screen::Cell;
+
+    #[test]
+    fn output_buffer_coalesces_reads_without_losing_bytes() {
+        let output = OutputBuffer::default();
+        assert!(output.push(b"first"));
+        assert!(!output.push(b" second"));
+        assert_eq!(output.take(), b"first second");
+        assert!(output.push(b"third"));
+        assert_eq!(output.take(), b"third");
+    }
+
+    #[test]
+    #[ignore]
+    fn profile_full_screen_rasterization() {
+        let Some(font) = load_fonts("monospace").into_iter().next() else {
+            return;
+        };
+        let cell = CellSize::for_font(&font, DEFAULT_FONT_SIZE);
+        let mut terminal = Terminal::new(ROWS, COLS);
+        terminal.cursor.visible = false;
+        let mut renderer = TextRenderer::new(&FontSettings::default(), cell);
+        let mut pixels = Vec::new();
+        let start = Instant::now();
+        for _ in 0..10 {
+            rasterize(&terminal, cell, &mut renderer, "", 0, None, &mut pixels);
+        }
+        eprintln!("blank average {:?}", start.elapsed() / 10);
+        for (i, item) in terminal.screen.cells.iter_mut().enumerate() {
+            item.ch = (b'!' + (i % 90) as u8) as char;
+        }
+        let start = Instant::now();
+        rasterize(&terminal, cell, &mut renderer, "", 0, None, &mut pixels);
+        let cold = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..10 {
+            rasterize(&terminal, cell, &mut renderer, "", 0, None, &mut pixels);
+        }
+        eprintln!("cold {cold:?}, warm average {:?}", start.elapsed() / 10);
+    }
 
     #[test]
     fn parses_font_settings() {
