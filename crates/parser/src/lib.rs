@@ -1,36 +1,10 @@
-use crate::utf8::Utf8Decoder;
-
+mod action;
+mod sequence;
 mod utf8;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Action {
-    Print(char),
-    Control(u8),
-    Esc(Esc),
-    Csi(Csi),
-    Osc(Osc),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Esc {
-    pub intermediates: [u8; 2],
-    pub intermediate_len: usize,
-    pub final_byte: u8,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Csi {
-    pub private: Option<u8>,
-    pub params: Vec<Option<u16>>,
-    pub intermediates: Vec<u8>,
-    pub final_byte: u8,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Osc {
-    pub command: u16,
-    pub data: Vec<u8>,
-}
+pub use action::{Action, Csi, Esc, Osc};
+use sequence::{CsiParser, EscParser, OscParser};
+use utf8::Utf8Decoder;
 
 #[derive(Debug, Default, Clone, Copy)]
 enum State {
@@ -72,8 +46,7 @@ impl Parser {
         match self.state {
             State::Ground => self.advance_ground(byte),
             State::Escape => self.advance_escape(byte),
-            State::CsiEntry => self.advance_csi_entry(byte),
-            State::CsiParam => self.advance_csi_param(byte),
+            State::CsiEntry | State::CsiParam => self.advance_csi(byte),
             State::CsiIntermediate => self.advance_csi_intermediate(byte),
             State::CsiIgnore => self.advance_csi_ignore(byte),
             State::OscString => self.advance_osc_string(byte),
@@ -131,7 +104,7 @@ impl Parser {
         None
     }
 
-    fn advance_csi_entry(&mut self, byte: u8) -> Option<Action> {
+    fn advance_csi(&mut self, byte: u8) -> Option<Action> {
         match byte {
             0x30..=0x39 => {
                 self.csi.push_digit(byte);
@@ -142,34 +115,12 @@ impl Parser {
                 self.state = State::CsiParam;
             }
             b'<' | b'=' | b'>' | b'?' => {
-                self.csi.set_private(byte);
-                self.state = State::CsiParam;
-            }
-            0x20..=0x2f => {
-                self.csi.push_intermediate(byte);
-                self.state = State::CsiIntermediate;
-            }
-            0x40..=0x7e => {
-                return Some(self.finish_csi(byte));
-            }
-            _ => {}
-        }
-
-        None
-    }
-
-    fn advance_csi_param(&mut self, byte: u8) -> Option<Action> {
-        match byte {
-            0x30..=0x39 => {
-                self.csi.push_digit(byte);
-                self.state = State::CsiParam;
-            }
-            b';' | b':' => {
-                self.csi.finish_param();
-                self.state = State::CsiParam;
-            }
-            b'<' | b'=' | b'>' | b'?' => {
-                self.state = State::CsiIgnore;
+                if matches!(self.state, State::CsiEntry) {
+                    self.csi.set_private(byte);
+                    self.state = State::CsiParam;
+                } else {
+                    self.state = State::CsiIgnore;
+                }
             }
             0x20..=0x2f => {
                 self.csi.push_intermediate(byte);
@@ -225,9 +176,7 @@ impl Parser {
     fn advance_osc_string(&mut self, byte: u8) -> Option<Action> {
         match byte {
             // BEL
-            0x07 => {
-                self.finish_osc()?;
-            }
+            0x07 => return self.finish_osc(),
             // ESC
             0x1b => {
                 self.state = State::OscEscape;
@@ -243,11 +192,11 @@ impl Parser {
 
     fn advance_osc_escape(&mut self, byte: u8) -> Option<Action> {
         match byte {
-            b'\\' => {
-                self.finish_osc()?;
-            }
+            b'\\' => return self.finish_osc(),
             byte => {
+                self.osc.push(0x1b);
                 self.osc.push(byte);
+                self.state = State::OscString;
             }
         }
 
@@ -261,145 +210,15 @@ impl Parser {
     }
 }
 
-#[derive(Debug, Default)]
-struct EscParser {
-    intermediates: Vec<u8>,
-}
-
-impl EscParser {
-    fn reset(&mut self) {
-        self.intermediates.clear();
-    }
-
-    fn push(&mut self, byte: u8) {
-        self.intermediates.push(byte);
-    }
-
-    fn build(&mut self, final_byte: u8) -> Option<Esc> {
-        let intermediate_len = self.intermediates.len();
-
-        if intermediate_len > 2 {
-            self.intermediates.clear();
-            return None;
-        }
-
-        let mut intermediates = [0; 2];
-        intermediates[..intermediate_len].copy_from_slice(&self.intermediates);
-
-        let esc = Esc {
-            intermediates,
-            intermediate_len,
-            final_byte,
-        };
-
-        Some(esc)
-    }
-}
-
-#[derive(Debug, Default)]
-struct CsiParser {
-    private: Option<u8>,
-    params: Vec<Option<u16>>,
-    current_param: Option<u16>,
-    intermediates: Vec<u8>,
-}
-
-impl CsiParser {
-    fn reset(&mut self) {
-        self.private = None;
-        self.params.clear();
-        self.current_param = None;
-        self.intermediates.clear();
-    }
-
-    fn set_private(&mut self, byte: u8) {
-        self.private = Some(byte);
-    }
-
-    fn push_digit(&mut self, byte: u8) {
-        let digit = u16::from(byte - b'0');
-
-        self.current_param = Some(
-            self.current_param
-                .unwrap_or(0)
-                .saturating_mul(10)
-                .saturating_add(digit),
-        );
-    }
-
-    fn finish_param(&mut self) {
-        self.params.push(self.current_param.take());
-    }
-
-    fn push_intermediate(&mut self, byte: u8) {
-        self.intermediates.push(byte);
-    }
-
-    fn build(&mut self, final_byte: u8) -> Csi {
-        Csi {
-            private: self.private,
-            params: self.params.clone(),
-            intermediates: self.intermediates.clone(),
-            final_byte,
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct OscParser {
-    data: Vec<u8>,
-}
-
-impl OscParser {
-    fn reset(&mut self) {
-        self.data.clear();
-    }
-
-    fn push(&mut self, byte: u8) {
-        self.data.push(byte);
-    }
-
-    fn build(&mut self) -> Option<Osc> {
-        let mut parts = self.data.splitn(2, |&b| b == b';');
-
-        let command = parts.next().unwrap();
-        let data = parts.next()?;
-
-        let command = std::str::from_utf8(command)
-            .ok()
-            .and_then(|s| s.parse::<u16>().ok())?;
-
-        Some(Osc {
-            command,
-            data: data.to_vec(),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
-
-    thread_local! {
-        static ACTIONS: RefCell<Vec<Action>> = const {
-            RefCell::new(Vec::new())
-        };
-    }
-
-    fn callback(action: Action) {
-        ACTIONS.with(|actions| {
-            actions.borrow_mut().push(action);
-        });
-    }
 
     fn parse(input: &[u8]) -> Vec<Action> {
-        ACTIONS.with(|actions| actions.borrow_mut().clear());
-
         let mut parser = Parser::default();
-        parser.advance(input, callback);
-
-        ACTIONS.with(|actions| actions.borrow().clone())
+        let mut actions = Vec::new();
+        parser.advance(input, |action| actions.push(action));
+        actions
     }
 
     #[test]
@@ -522,5 +341,58 @@ mod tests {
                 final_byte: b'h',
             }),],
         );
+    }
+
+    #[test]
+    fn parses_osc_with_bel_and_st() {
+        let osc = Action::Osc(Osc {
+            command: 0,
+            data: b"title".to_vec(),
+        });
+        assert_eq!(
+            parse(b"\x1b]0;title\x07A"),
+            vec![osc.clone(), Action::Print('A')]
+        );
+        assert_eq!(parse(b"\x1b]0;title\x1b\\A"), vec![osc, Action::Print('A')]);
+    }
+
+    #[test]
+    fn keeps_osc_escape_in_data_when_not_terminator() {
+        assert_eq!(
+            parse(b"\x1b]0;a\x1bb\x07"),
+            vec![Action::Osc(Osc {
+                command: 0,
+                data: b"a\x1bb".to_vec(),
+            })],
+        );
+    }
+
+    #[test]
+    fn parses_sequences_across_calls() {
+        let mut parser = Parser::default();
+        let mut actions = Vec::new();
+        for chunk in [b"\x1b[?".as_slice(), b"25h\x1b]0;ti", b"tle\x1b\\"] {
+            parser.advance(chunk, |action| actions.push(action));
+        }
+        assert_eq!(
+            actions,
+            vec![
+                Action::Csi(Csi {
+                    private: Some(b'?'),
+                    params: vec![Some(25)],
+                    intermediates: vec![],
+                    final_byte: b'h',
+                }),
+                Action::Osc(Osc {
+                    command: 0,
+                    data: b"title".to_vec(),
+                }),
+            ],
+        );
+    }
+
+    #[test]
+    fn ignores_invalid_csi_and_resumes_printing() {
+        assert_eq!(parse(b"\x1b[1?25hA"), vec![Action::Print('A')]);
     }
 }
