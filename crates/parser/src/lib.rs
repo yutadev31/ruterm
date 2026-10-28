@@ -1,5 +1,7 @@
 use crate::utf8::Utf8Decoder;
 
+mod utf8;
+
 #[derive(Debug)]
 pub enum Action {
     Print(char),

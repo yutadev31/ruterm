@@ -43,6 +43,10 @@ name = "ruterm-core"
 version = "0.1.0"
 
 [[package]]
+name = "ruterm-parser"
+version = "0.1.0"
+
+[[package]]
 name = "ruterm-pty"
 version = "0.1.0"
 dependencies = [
