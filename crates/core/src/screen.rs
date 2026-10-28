@@ -1,18 +1,5 @@
 use crate::attributes::Attributes;
 use std::collections::VecDeque;
-use std::ops::Range;
-
-pub(crate) fn clone_within(cells: &mut [Cell], source: Range<usize>, destination: usize) {
-    if destination > source.start {
-        for offset in (0..source.len()).rev() {
-            cells[destination + offset] = cells[source.start + offset].clone();
-        }
-    } else {
-        for offset in 0..source.len() {
-            cells[destination + offset] = cells[source.start + offset].clone();
-        }
-    }
-}
 
 #[derive(Debug)]
 pub struct Screen {
@@ -92,16 +79,17 @@ impl Screen {
             return;
         }
         let lines = amount.min(self.height);
-        for row in 0..lines {
+        let mut removed = self.cells.drain(..lines * self.width);
+        for _ in 0..lines {
             self.scrollback
-                .push_back(self.cells[row * self.width..(row + 1) * self.width].to_vec());
+                .push_back(removed.by_ref().take(self.width).collect());
         }
+        drop(removed);
         while self.scrollback.len() > 1000 {
             self.scrollback.pop_front();
         }
-        let len = self.cells.len();
-        clone_within(&mut self.cells, lines * self.width..len, 0);
-        self.cells[(self.height - lines) * self.width..].fill(Cell::default());
+        self.cells
+            .extend(std::iter::repeat_with(Cell::default).take(lines * self.width));
     }
 
     pub fn scroll_down(&mut self, amount: usize) {
@@ -109,11 +97,7 @@ impl Screen {
             return;
         }
         let lines = amount.min(self.height);
-        clone_within(
-            &mut self.cells,
-            0..(self.height - lines) * self.width,
-            lines * self.width,
-        );
+        self.cells.rotate_right(lines * self.width);
         self.cells[..lines * self.width].fill(Cell::default());
     }
 
@@ -134,5 +118,33 @@ impl Screen {
                 }
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrolling_multiple_lines_moves_cells_and_preserves_scrollback() {
+        let mut screen = Screen::new(4, 1);
+        for (cell, ch) in screen.cells.iter_mut().zip(['a', 'b', 'c', 'd']) {
+            cell.ch = ch;
+            cell.combining.push('\u{301}');
+        }
+        screen.scroll_up(2);
+        assert_eq!(screen.scrollback[0][0].ch, 'a');
+        assert_eq!(screen.scrollback[1][0].ch, 'b');
+        assert_eq!(
+            screen.cells.iter().map(|cell| cell.ch).collect::<String>(),
+            "cd  "
+        );
+        assert_eq!(screen.cells[0].combining, "\u{301}");
+        screen.scroll_down(2);
+        assert_eq!(
+            screen.cells.iter().map(|cell| cell.ch).collect::<String>(),
+            "  cd"
+        );
+        assert_eq!(screen.cells[2].combining, "\u{301}");
     }
 }

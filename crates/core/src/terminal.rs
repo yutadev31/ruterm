@@ -4,7 +4,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::{
     attributes::{Attributes, Color, Flags, UnderlineStyle},
     common::Position,
-    screen::{Cell, Screen, clone_within},
+    screen::{Cell, Screen},
 };
 
 #[derive(Debug)]
@@ -404,7 +404,7 @@ impl Terminal {
             return;
         }
         let n = count.min(end - start);
-        clone_within(&mut self.screen.cells, start..end - n, start + n);
+        self.screen.cells[start..end].rotate_right(n);
         self.erase_range(start, start + n);
     }
 
@@ -421,7 +421,7 @@ impl Terminal {
             return;
         }
         let n = count.min(end - start);
-        clone_within(&mut self.screen.cells, start + n..end, start);
+        self.screen.cells[start..end].rotate_left(n);
         self.erase_range(end - n, end);
     }
 
@@ -433,7 +433,7 @@ impl Terminal {
             return;
         }
         let n = count.min(self.screen.rows() - self.cursor.position.row) * cols;
-        clone_within(&mut self.screen.cells, start..end - n, start + n);
+        self.screen.cells[start..end].rotate_right(n);
         self.erase_range(start, start + n);
     }
 
@@ -445,19 +445,14 @@ impl Terminal {
             return;
         }
         let n = count.min(self.screen.rows() - self.cursor.position.row) * cols;
-        clone_within(&mut self.screen.cells, start + n..end, start);
+        self.screen.cells[start..end].rotate_left(n);
         self.erase_range(end - n, end);
     }
 
     fn sgr(&mut self, params: &[Option<u16>]) {
-        let values: Vec<u16> = if params.is_empty() {
-            vec![0]
-        } else {
-            params.iter().map(|p| p.unwrap_or(0)).collect()
-        };
         let mut i = 0;
-        while i < values.len() {
-            let code = values[i];
+        while i < params.len().max(1) {
+            let code = params.get(i).copied().flatten().unwrap_or(0);
             match code {
                 0 => self.attrs = Attributes::default(),
                 1 => self.attrs.flags.insert(Flags::BOLD),
@@ -483,7 +478,9 @@ impl Terminal {
                 39 => self.attrs.fg = Color::Default,
                 49 => self.attrs.bg = Color::Default,
                 38 | 48 => {
-                    if let Some((color, consumed)) = parse_extended_color(&values[i + 1..]) {
+                    if let Some((color, consumed)) =
+                        parse_extended_color(params.get(i + 1..).unwrap_or(&[]))
+                    {
                         if code == 38 {
                             self.attrs.fg = color;
                         } else {
@@ -499,11 +496,22 @@ impl Terminal {
     }
 }
 
-fn parse_extended_color(values: &[u16]) -> Option<(Color, usize)> {
+fn parse_extended_color(values: &[Option<u16>]) -> Option<(Color, usize)> {
     match values {
-        [5, index, ..] if *index <= 255 => Some((Color::Indexed(*index as u8), 2)),
-        [2, r, g, b, ..] if *r <= 255 && *g <= 255 && *b <= 255 => {
-            Some((Color::Rgb(*r as u8, *g as u8, *b as u8), 4))
+        [Some(5), index, ..] if index.unwrap_or(0) <= 255 => {
+            Some((Color::Indexed(index.unwrap_or(0) as u8), 2))
+        }
+        [Some(2), r, g, b, ..]
+            if r.unwrap_or(0) <= 255 && g.unwrap_or(0) <= 255 && b.unwrap_or(0) <= 255 =>
+        {
+            Some((
+                Color::Rgb(
+                    r.unwrap_or(0) as u8,
+                    g.unwrap_or(0) as u8,
+                    b.unwrap_or(0) as u8,
+                ),
+                4,
+            ))
         }
         _ => None,
     }

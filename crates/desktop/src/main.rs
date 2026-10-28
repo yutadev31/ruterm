@@ -294,6 +294,7 @@ struct App {
     gpu: Option<Gpu>,
     fonts: Vec<FontVec>,
     glyph_cache: HashMap<char, Option<GlyphBitmap>>,
+    pixels: Vec<u8>,
     terminal: Terminal,
     parser: Parser,
     pty: Option<Pty>,
@@ -319,6 +320,7 @@ impl App {
             gpu: None,
             fonts: load_fonts(),
             glyph_cache: HashMap::new(),
+            pixels: Vec::new(),
             terminal: Terminal::new(ROWS, COLS),
             parser: Parser::default(),
             pty: None,
@@ -741,16 +743,17 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested if self.drawable => {
                 self.last_frame = Some(Instant::now());
                 self.update_ime_area();
-                let pixels = rasterize(
+                rasterize(
                     &self.terminal,
                     &self.fonts,
                     &mut self.glyph_cache,
                     &self.preedit,
                     self.scroll_offset,
                     self.selection,
+                    &mut self.pixels,
                 );
                 if let Some(gpu) = &mut self.gpu {
-                    match gpu.render(&pixels) {
+                    match gpu.render(&self.pixels) {
                         Ok(()) => {}
                         Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                             let size = self.window.as_ref().unwrap().inner_size();
@@ -851,11 +854,12 @@ fn rasterize(
     preedit: &str,
     scroll_offset: usize,
     selection: Option<(usize, usize)>,
-) -> Vec<u8> {
+    pixels: &mut Vec<u8>,
+) {
     let cols = terminal.screen.cols();
     let rows = terminal.screen.rows();
     let width = cols * CELL_W;
-    let mut pixels = vec![0; width * rows * CELL_H * 4];
+    pixels.resize(width * rows * CELL_H * 4, 0);
     let mut cells: Cow<'_, [ruterm_core::screen::Cell]> = if scroll_offset == 0 {
         Cow::Borrowed(&terminal.screen.cells)
     } else {
@@ -902,7 +906,7 @@ fn rasterize(
             }
             for y in 0..CELL_H {
                 for x in 0..CELL_W {
-                    put_pixel(&mut pixels, width, col * CELL_W + x, row * CELL_H + y, bg);
+                    put_pixel(pixels, width, col * CELL_W + x, row * CELL_H + y, bg);
                 }
             }
         }
@@ -960,7 +964,7 @@ fn rasterize(
                             let mixed = std::array::from_fn(|i| {
                                 (fg[i] as f32 * alpha + bg[i] as f32 * (1.0 - alpha)) as u8
                             });
-                            put_pixel(&mut pixels, width, px as usize, py as usize, mixed);
+                            put_pixel(pixels, width, px as usize, py as usize, mixed);
                         }
                     }
                 }
@@ -968,7 +972,7 @@ fn rasterize(
             if cell.attrs.underline != ruterm_core::attributes::UnderlineStyle::None {
                 for x in 0..span * CELL_W {
                     put_pixel(
-                        &mut pixels,
+                        pixels,
                         width,
                         col * CELL_W + x,
                         row * CELL_H + CELL_H - 2,
@@ -978,7 +982,6 @@ fn rasterize(
             }
         }
     }
-    pixels
 }
 
 fn put_pixel(pixels: &mut [u8], width: usize, x: usize, y: usize, color: [u8; 3]) {
@@ -1072,10 +1075,27 @@ mod tests {
                 ..Default::default()
             },
         );
-        let pixels = rasterize(&terminal, &[], &mut HashMap::new(), "", 0, None);
+        let mut pixels = Vec::new();
+        rasterize(
+            &terminal,
+            &[],
+            &mut HashMap::new(),
+            "",
+            0,
+            None,
+            &mut pixels,
+        );
         assert_eq!(&pixels[..4], &[4, 5, 6, 255]);
         terminal.cursor.visible = true;
-        let pixels = rasterize(&terminal, &[], &mut HashMap::new(), "", 0, None);
+        rasterize(
+            &terminal,
+            &[],
+            &mut HashMap::new(),
+            "",
+            0,
+            None,
+            &mut pixels,
+        );
         assert_eq!(&pixels[..4], &[220, 220, 220, 255]);
     }
 
