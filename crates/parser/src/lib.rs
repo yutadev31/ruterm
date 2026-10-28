@@ -2,7 +2,7 @@ use crate::utf8::Utf8Decoder;
 
 mod utf8;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Print(char),
     Control(u8),
@@ -11,14 +11,14 @@ pub enum Action {
     Osc(Osc),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Esc {
     pub intermediates: [u8; 2],
     pub intermediate_len: usize,
     pub final_byte: u8,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Csi {
     pub private: Option<u8>,
     pub params: Vec<Option<u16>>,
@@ -26,7 +26,7 @@ pub struct Csi {
     pub final_byte: u8,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Osc {
     pub command: u16,
     pub data: Vec<u8>,
@@ -215,6 +215,10 @@ impl Parser {
     }
 
     fn finish_csi(&mut self, byte: u8) -> Action {
+        if let State::CsiParam = self.state {
+            self.csi.finish_param();
+        }
+
         self.state = State::Ground;
 
         let csi = self.csi.build(byte);
@@ -295,8 +299,11 @@ impl EscParser {
             return None;
         }
 
+        let mut intermediates = [0; 2];
+        intermediates[..intermediate_len].copy_from_slice(&self.intermediates);
+
         let esc = Esc {
-            intermediates: self.intermediates.clone().try_into().unwrap(),
+            intermediates,
             intermediate_len,
             final_byte,
         };
@@ -382,5 +389,139 @@ impl OscParser {
             command,
             data: data.to_vec(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static ACTIONS: RefCell<Vec<Action>> = const {
+            RefCell::new(Vec::new())
+        };
+    }
+
+    fn callback(action: Action) {
+        ACTIONS.with(|actions| {
+            actions.borrow_mut().push(action);
+        });
+    }
+
+    fn parse(input: &[u8]) -> Vec<Action> {
+        ACTIONS.with(|actions| actions.borrow_mut().clear());
+
+        let mut parser = Parser::new();
+        parser.advance(input, callback);
+
+        ACTIONS.with(|actions| actions.borrow().clone())
+    }
+
+    #[test]
+    fn prints_ascii() {
+        assert_eq!(
+            parse(b"abc"),
+            vec![Action::Print('a'), Action::Print('b'), Action::Print('c'),],
+        );
+    }
+
+    #[test]
+    fn prints_utf8() {
+        assert_eq!(
+            parse("日本語".as_bytes()),
+            vec![
+                Action::Print('日'),
+                Action::Print('本'),
+                Action::Print('語'),
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_control() {
+        assert_eq!(
+            parse(b"\r\n"),
+            vec![Action::Control(b'\r'), Action::Control(b'\n'),],
+        );
+    }
+
+    #[test]
+    fn parses_esc() {
+        assert_eq!(
+            parse(b"\x1b7"),
+            vec![Action::Esc(Esc {
+                intermediates: Default::default(),
+                intermediate_len: 0,
+                final_byte: b'7',
+            }),],
+        );
+    }
+
+    #[test]
+    fn parses_esc_with_intermediate() {
+        let actions = parse(b"\x1b(B");
+
+        assert_eq!(actions.len(), 1);
+
+        assert!(matches!(
+            &actions[0],
+            Action::Esc(Esc {
+                final_byte: b'B',
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_csi_sgr() {
+        assert_eq!(
+            parse(b"\x1b[31m"),
+            vec![Action::Csi(Csi {
+                private: None,
+                params: vec![Some(31)],
+                intermediates: vec![],
+                final_byte: b'm',
+            }),],
+        );
+    }
+
+    #[test]
+    fn parses_csi_multiple_params() {
+        assert_eq!(
+            parse(b"\x1b[1;31;42m"),
+            vec![Action::Csi(Csi {
+                private: None,
+                params: vec![Some(1), Some(31), Some(42),],
+                intermediates: vec![],
+                final_byte: b'm',
+            }),],
+        );
+    }
+
+    #[test]
+    fn parses_empty_csi_params() {
+        assert_eq!(
+            parse(b"\x1b[;31m"),
+            vec![Action::Csi(Csi {
+                private: None,
+                params: vec![None, Some(31),],
+                intermediates: vec![],
+                final_byte: b'm',
+            }),],
+        );
+    }
+
+    #[test]
+    fn parses_private_csi() {
+        assert_eq!(
+            parse(b"\x1b[?25h"),
+            vec![Action::Csi(Csi {
+                private: Some(b'?'),
+                params: vec![Some(25)],
+                intermediates: vec![],
+                final_byte: b'h',
+            }),],
+        );
     }
 }
