@@ -54,32 +54,31 @@ pub struct Parser {
     esc: EscParser,
     csi: CsiParser,
     osc: OscParser,
-    callback: fn(Action),
 }
 
 impl Parser {
-    pub fn new(callback: fn(Action)) -> Self {
+    pub fn new() -> Self {
         Self {
             state: State::default(),
             utf8: Utf8Decoder::default(),
             esc: EscParser::default(),
             csi: CsiParser::default(),
             osc: OscParser::default(),
-            callback,
         }
     }
 
-    fn emit(&mut self, action: Action) {
-        (self.callback)(action);
-    }
-
-    pub fn advance(&mut self, bytes: &[u8]) {
+    pub fn advance<F>(&mut self, bytes: &[u8], mut callback: F)
+    where
+        F: FnMut(Action),
+    {
         for &byte in bytes {
-            self.advance_byte(byte);
+            if let Some(action) = self.advance_byte(byte) {
+                callback(action)
+            }
         }
     }
 
-    fn advance_byte(&mut self, byte: u8) {
+    fn advance_byte(&mut self, byte: u8) -> Option<Action> {
         match self.state {
             State::Ground => self.advance_ground(byte),
             State::Escape => self.advance_escape(byte),
@@ -92,7 +91,7 @@ impl Parser {
         }
     }
 
-    fn advance_ground(&mut self, byte: u8) {
+    fn advance_ground(&mut self, byte: u8) -> Option<Action> {
         match byte {
             0x1b => {
                 self.esc.reset();
@@ -100,18 +99,20 @@ impl Parser {
             }
 
             0x00..=0x1f | 0x7f => {
-                self.emit(Action::Control(byte));
+                return Some(Action::Control(byte));
             }
 
             _ => {
                 if let Some(ch) = self.utf8.decode(byte) {
-                    self.emit(Action::Print(ch));
+                    return Some(Action::Print(ch));
                 }
             }
         }
+
+        None
     }
 
-    fn advance_escape(&mut self, byte: u8) {
+    fn advance_escape(&mut self, byte: u8) -> Option<Action> {
         match byte {
             // CSI
             b'[' => {
@@ -131,16 +132,18 @@ impl Parser {
             }
             0x30..=0x7e => {
                 if let Some(esc) = self.esc.build(byte) {
-                    self.emit(Action::Esc(esc));
+                    return Some(Action::Esc(esc));
                 }
                 self.state = State::Ground;
             }
 
             _ => {}
         }
+
+        None
     }
 
-    fn advance_csi_entry(&mut self, byte: u8) {
+    fn advance_csi_entry(&mut self, byte: u8) -> Option<Action> {
         match byte {
             0x30..=0x39 => {
                 self.csi.push_digit(byte);
@@ -159,13 +162,15 @@ impl Parser {
                 self.state = State::CsiIntermediate;
             }
             0x40..=0x7e => {
-                self.finish_csi(byte);
+                return Some(self.finish_csi(byte));
             }
             _ => {}
         }
+
+        None
     }
 
-    fn advance_csi_param(&mut self, byte: u8) {
+    fn advance_csi_param(&mut self, byte: u8) -> Option<Action> {
         match byte {
             0x30..=0x39 => {
                 self.csi.push_digit(byte);
@@ -183,13 +188,15 @@ impl Parser {
                 self.state = State::CsiIntermediate;
             }
             0x40..=0x7e => {
-                self.finish_csi(byte);
+                return Some(self.finish_csi(byte));
             }
             _ => {}
         }
+
+        None
     }
 
-    fn advance_csi_intermediate(&mut self, byte: u8) {
+    fn advance_csi_intermediate(&mut self, byte: u8) -> Option<Action> {
         match byte {
             0x30..=0x3f => {
                 self.state = State::CsiIgnore;
@@ -199,31 +206,35 @@ impl Parser {
                 self.state = State::CsiIntermediate;
             }
             0x40..=0x7e => {
-                self.finish_csi(byte);
+                return Some(self.finish_csi(byte));
             }
             _ => {}
         }
+
+        None
     }
 
-    fn finish_csi(&mut self, byte: u8) {
-        let csi = self.csi.build(byte);
-        self.emit(Action::Csi(csi));
-
+    fn finish_csi(&mut self, byte: u8) -> Action {
         self.state = State::Ground;
+
+        let csi = self.csi.build(byte);
+        Action::Csi(csi)
     }
 
-    fn advance_csi_ignore(&mut self, byte: u8) {
+    fn advance_csi_ignore(&mut self, byte: u8) -> Option<Action> {
         if let 0x40..=0x7e = byte {
             self.csi.reset();
             self.state = State::Ground;
         }
+
+        None
     }
 
-    fn advance_osc_string(&mut self, byte: u8) {
+    fn advance_osc_string(&mut self, byte: u8) -> Option<Action> {
         match byte {
             // BEL
             0x07 => {
-                self.finish_osc();
+                self.finish_osc()?;
             }
             // ESC
             0x1b => {
@@ -234,25 +245,31 @@ impl Parser {
                 self.osc.push(byte);
             }
         }
+
+        None
     }
 
-    fn advance_osc_escape(&mut self, byte: u8) {
+    fn advance_osc_escape(&mut self, byte: u8) -> Option<Action> {
         match byte {
             b'\\' => {
-                self.finish_osc();
+                self.finish_osc()?;
             }
             byte => {
                 self.osc.push(byte);
             }
         }
+
+        None
     }
 
-    fn finish_osc(&mut self) {
-        if let Some(osc) = self.osc.build() {
-            self.emit(Action::Osc(osc));
-        }
-
+    fn finish_osc(&mut self) -> Option<Action> {
         self.state = State::Ground;
+
+        if let Some(osc) = self.osc.build() {
+            Some(Action::Osc(osc))
+        } else {
+            None
+        }
     }
 }
 
