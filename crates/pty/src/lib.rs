@@ -12,9 +12,8 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::chdir;
 use nix::unistd::{Pid, pipe2};
 use nix::{
-    libc::{TIOCSCTTY, ioctl},
-    pty::{Winsize, openpty},
-    unistd::{dup2_stderr, dup2_stdin, dup2_stdout, execvpe, fork, setsid},
+    pty::{ForkptyResult, Winsize, forkpty},
+    unistd::execvpe,
 };
 
 pub struct Pty {
@@ -47,8 +46,6 @@ impl Pty {
             ws_xpixel: options.size.pixel_width,
             ws_ypixel: options.size.pixel_height,
         };
-
-        let pty = openpty(&winsize, None)?;
 
         let program = CString::new(options.program.as_str())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -83,12 +80,13 @@ impl Pty {
 
         let (error_read, error_write) = pipe2(OFlag::O_CLOEXEC)?;
 
-        match unsafe { fork()? } {
-            nix::unistd::ForkResult::Parent { child } => {
-                drop(pty.slave);
+        match unsafe { forkpty(&winsize, None)? } {
+            ForkptyResult::Parent { master, child } => {
                 drop(error_write);
+
                 let mut error_read = File::from(error_read);
                 let mut bytes = [0; 4];
+
                 match error_read.read_exact(&mut bytes) {
                     Ok(()) => {
                         let _ = waitpid(child, None);
@@ -97,44 +95,21 @@ impl Pty {
                     Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
                     Err(error) => return Err(error),
                 }
+
                 Ok(Self {
-                    master: File::from(pty.master),
+                    master: File::from(master),
                     pid: child,
                     status: None,
                 })
             }
-            nix::unistd::ForkResult::Child => {
-                drop(pty.master);
-                let slave = pty.slave;
-
+            ForkptyResult::Child => {
                 drop(error_read);
-                if let Err(errno) = setsid() {
-                    child_error(&error_write, errno);
-                }
-
-                if unsafe { ioctl(slave.as_raw_fd(), TIOCSCTTY, 0) } == -1 {
-                    child_error(&error_write, Errno::last());
-                }
-
-                if let Err(errno) = dup2_stdin(&slave) {
-                    child_error(&error_write, errno);
-                }
-
-                if let Err(errno) = dup2_stdout(&slave) {
-                    child_error(&error_write, errno);
-                }
-
-                if let Err(errno) = dup2_stderr(&slave) {
-                    child_error(&error_write, errno);
-                }
 
                 if let Some(cwd) = &options.cwd
                     && let Err(errno) = chdir(cwd)
                 {
                     child_error(&error_write, errno);
                 }
-
-                drop(slave);
 
                 let Err(errno) = execvpe(&program, &args, &environment);
                 child_error(&error_write, errno);
@@ -250,6 +225,20 @@ mod tests {
         let mut output = [0; 64];
         let count = pty.reader().read(&mut output).unwrap();
         assert_eq!(&output[..count], b"passed");
+        pty.terminate().unwrap();
+    }
+
+    #[test]
+    fn connects_child_standard_streams_to_pty() {
+        let mut options = options("/bin/sh");
+        options.args = vec![
+            "-c".into(),
+            "test -t 0 && test -t 1 && test -t 2 && printf ready".into(),
+        ];
+        let mut pty = Pty::spawn(options).unwrap();
+        let mut output = [0; 5];
+        pty.reader().read_exact(&mut output).unwrap();
+        assert_eq!(&output, b"ready");
         pty.terminate().unwrap();
     }
 }
