@@ -1621,7 +1621,12 @@ mod tests {
             assert!(glyph.width >= cell.width * span);
             assert_eq!(glyph.height, cell.height);
             assert!(
-                glyph.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0),
+                glyph
+                    .rgba
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[3] != 0),
                 "{text}"
             );
         }
@@ -1733,7 +1738,9 @@ mod tests {
         rasterize(&terminal, cell, &mut renderer, "", 0, None, &mut pixels);
         assert!(
             pixels
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|pixel| pixel[0] > 0 && pixel[1] == 0 && pixel[2] == 0)
         );
     }
