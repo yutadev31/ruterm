@@ -1,4 +1,4 @@
-use crate::{Csi, Dcs, Esc, Osc};
+use crate::{Csi, CsiParam, Dcs, Esc, Osc};
 
 #[derive(Debug, Default)]
 pub(crate) struct EscParser {
@@ -34,6 +34,7 @@ impl EscParser {
 pub(crate) struct CsiParser {
     private: Option<u8>,
     params: Vec<Option<u16>>,
+    separators: Vec<u8>,
     current_param: Option<u16>,
     intermediates: Vec<u8>,
 }
@@ -42,6 +43,7 @@ impl CsiParser {
     pub(crate) fn reset(&mut self) {
         self.private = None;
         self.params.clear();
+        self.separators.clear();
         self.current_param = None;
         self.intermediates.clear();
     }
@@ -64,14 +66,31 @@ impl CsiParser {
         self.params.push(self.current_param.take());
     }
 
+    pub(crate) fn separator(&mut self, byte: u8) {
+        self.finish_param();
+        self.separators.push(byte);
+    }
+
     pub(crate) fn push_intermediate(&mut self, byte: u8) {
         self.intermediates.push(byte);
     }
 
     pub(crate) fn build(&self, final_byte: u8) -> Csi {
+        let mut params = Vec::new();
+        let mut subparams = Vec::new();
+        for (index, value) in self.params.iter().copied().enumerate() {
+            if index > 0 && self.separators.get(index - 1) == Some(&b';') {
+                params.push(CsiParam { subparams });
+                subparams = Vec::new();
+            }
+            subparams.push(value);
+        }
+        if !subparams.is_empty() {
+            params.push(CsiParam { subparams });
+        }
         Csi {
             private: self.private,
-            params: self.params.clone(),
+            params,
             intermediates: self.intermediates.clone(),
             final_byte,
         }
@@ -104,12 +123,11 @@ impl DcsParser {
     }
 
     pub(crate) fn build(&self) -> Dcs {
-        let header = self.header.build(self.final_byte);
         Dcs {
-            private: header.private,
-            params: header.params,
-            intermediates: header.intermediates,
-            final_byte: header.final_byte,
+            private: self.header.private,
+            params: self.header.params.clone(),
+            intermediates: self.header.intermediates.clone(),
+            final_byte: self.final_byte,
             data: self.data.clone(),
         }
     }

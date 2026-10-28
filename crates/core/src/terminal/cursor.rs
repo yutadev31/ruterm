@@ -41,10 +41,11 @@ impl Terminal {
     }
 
     pub(super) fn line_feed(&mut self) {
-        if self.cursor.position.row + 1 < self.screen.rows() {
+        if self.cursor.position.row == self.scroll_bottom.saturating_sub(1) {
+            self.screen
+                .scroll_up_region(self.scroll_top, self.scroll_bottom, 1);
+        } else if self.cursor.position.row + 1 < self.screen.rows() {
             self.cursor.position.row += 1;
-        } else {
-            self.screen.scroll_up(1);
         }
     }
 
@@ -62,8 +63,9 @@ impl Terminal {
     }
 
     pub(super) fn reverse_index(&mut self) {
-        if self.cursor.position.row == 0 {
-            self.screen.scroll_down(1);
+        if self.cursor.position.row == self.scroll_top {
+            self.screen
+                .scroll_down_region(self.scroll_top, self.scroll_bottom, 1);
         } else {
             self.cursor.position.row -= 1;
         }
@@ -119,5 +121,18 @@ impl Terminal {
         self.tab_stops = (0..self.screen.cols())
             .map(|col| col != 0 && col % 8 == 0)
             .collect();
+        self.scroll_top = 0;
+        self.scroll_bottom = self.screen.rows();
+        self.origin_mode = false;
+        self.auto_wrap = true;
+        self.insert_mode = false;
+        self.bracketed_paste = false;
+        self.application_cursor = false;
+        self.application_keypad = false;
+        self.mouse_mode = super::MouseMode::Off;
+        self.sgr_mouse = false;
+        self.cursor_shape = super::CursorShape::Block;
+        self.charsets = [false; 2];
+        self.active_charset = 0;
     }
 }

@@ -83,32 +83,51 @@ impl Screen {
     }
 
     pub fn scroll_up(&mut self, amount: usize) {
+        self.scroll_up_region(0, self.height, amount);
+    }
+
+    pub fn scroll_up_region(&mut self, top: usize, bottom: usize, amount: usize) {
         if self.width == 0 || self.height == 0 {
             return;
         }
-        let lines = amount.min(self.height);
-        let mut removed = self.cells.drain(..lines * self.width);
-        if self.save_scrollback {
+        if top >= bottom || bottom > self.height {
+            return;
+        }
+        let lines = amount.min(bottom - top);
+        let start = top * self.width;
+        let end = bottom * self.width;
+        if top == 0 && bottom == self.height && self.save_scrollback {
+            let mut removed = self.cells[start..start + lines * self.width]
+                .iter()
+                .cloned();
             for _ in 0..lines {
                 self.scrollback
                     .push_back(removed.by_ref().take(self.width).collect());
             }
         }
-        drop(removed);
         while self.scrollback.len() > 1000 {
             self.scrollback.pop_front();
         }
-        self.cells
-            .extend(std::iter::repeat_with(Cell::default).take(lines * self.width));
+        self.cells[start..end].rotate_left(lines * self.width);
+        self.cells[end - lines * self.width..end].fill(Cell::default());
     }
 
     pub fn scroll_down(&mut self, amount: usize) {
+        self.scroll_down_region(0, self.height, amount);
+    }
+
+    pub fn scroll_down_region(&mut self, top: usize, bottom: usize, amount: usize) {
         if self.width == 0 || self.height == 0 {
             return;
         }
-        let lines = amount.min(self.height);
-        self.cells.rotate_right(lines * self.width);
-        self.cells[..lines * self.width].fill(Cell::default());
+        if top >= bottom || bottom > self.height {
+            return;
+        }
+        let lines = amount.min(bottom - top);
+        let start = top * self.width;
+        let end = bottom * self.width;
+        self.cells[start..end].rotate_right(lines * self.width);
+        self.cells[start..start + lines * self.width].fill(Cell::default());
     }
 
     pub fn clear(&mut self) {

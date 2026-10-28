@@ -14,7 +14,7 @@ use cosmic_text::{
     Weight, Wrap,
 };
 use ruterm_core::attributes::{Color, Flags};
-use ruterm_core::terminal::Terminal;
+use ruterm_core::terminal::{CursorShape, MouseMode, Terminal};
 use ruterm_parser::Parser;
 use ruterm_pty::{Pty, PtyOptions, PtySize};
 use winit::application::ApplicationHandler;
@@ -440,6 +440,7 @@ struct App {
     selection: Option<(usize, usize)>,
     dragging: bool,
     mouse_cell: usize,
+    mouse_button: Option<u8>,
     clipboard: Option<arboard::Clipboard>,
     last_frame: Option<Instant>,
     output_redraw_pending: bool,
@@ -479,6 +480,7 @@ impl App {
             selection: None,
             dragging: false,
             mouse_cell: 0,
+            mouse_button: None,
             clipboard: None,
             last_frame: None,
             output_redraw_pending: false,
@@ -587,13 +589,13 @@ impl App {
             Key::Named(NamedKey::Tab) => vec![b'\t'],
             Key::Named(NamedKey::Space) => vec![b' '],
             Key::Named(NamedKey::Escape) => vec![0x1b],
-            Key::Named(NamedKey::ArrowUp) => b"\x1b[A".to_vec(),
-            Key::Named(NamedKey::ArrowDown) => b"\x1b[B".to_vec(),
-            Key::Named(NamedKey::ArrowRight) => b"\x1b[C".to_vec(),
-            Key::Named(NamedKey::ArrowLeft) => b"\x1b[D".to_vec(),
+            Key::Named(NamedKey::ArrowUp) => self.cursor_key(b'A'),
+            Key::Named(NamedKey::ArrowDown) => self.cursor_key(b'B'),
+            Key::Named(NamedKey::ArrowRight) => self.cursor_key(b'C'),
+            Key::Named(NamedKey::ArrowLeft) => self.cursor_key(b'D'),
             Key::Named(NamedKey::Delete) => b"\x1b[3~".to_vec(),
-            Key::Named(NamedKey::Home) => b"\x1b[H".to_vec(),
-            Key::Named(NamedKey::End) => b"\x1b[F".to_vec(),
+            Key::Named(NamedKey::Home) => self.cursor_key(b'H'),
+            Key::Named(NamedKey::End) => self.cursor_key(b'F'),
             Key::Character(text) if self.modifiers.control_key() => text
                 .bytes()
                 .next()
@@ -607,6 +609,54 @@ impl App {
         };
         if !bytes.is_empty() {
             self.send_input(bytes);
+        }
+    }
+
+    fn cursor_key(&self, suffix: u8) -> Vec<u8> {
+        vec![
+            0x1b,
+            if self.terminal.application_cursor {
+                b'O'
+            } else {
+                b'['
+            },
+            suffix,
+        ]
+    }
+
+    fn send_mouse(&mut self, button: u8, release: bool) {
+        if self.terminal.mouse_mode == MouseMode::Off {
+            return;
+        }
+        let cols = self.terminal.screen.cols();
+        if cols == 0 {
+            return;
+        }
+        let x = self.mouse_cell % cols + 1;
+        let y = self.mouse_cell / cols + 1;
+        let mut code = button;
+        if self.modifiers.shift_key() {
+            code += 4;
+        }
+        if self.modifiers.alt_key() {
+            code += 8;
+        }
+        if self.modifiers.control_key() {
+            code += 16;
+        }
+        if self.terminal.sgr_mouse {
+            self.send_input(
+                format!("\x1b[<{code};{x};{y}{}", if release { 'm' } else { 'M' }).into_bytes(),
+            );
+        } else if x <= 223 && y <= 223 {
+            self.send_input(vec![
+                0x1b,
+                b'[',
+                b'M',
+                32 + if release { 3 } else { code },
+                (32 + x) as u8,
+                (32 + y) as u8,
+            ]);
         }
     }
 
@@ -706,7 +756,14 @@ impl App {
             eprintln!("Clipboard does not contain text");
             return;
         };
-        self.send_input(text.into_bytes());
+        if self.terminal.bracketed_paste {
+            let mut bytes = b"\x1b[200~".to_vec();
+            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            self.send_input(bytes);
+        } else {
+            self.send_input(text.into_bytes());
+        }
     }
 }
 
@@ -846,7 +903,16 @@ impl ApplicationHandler<UserEvent> for App {
                 let rows = self.terminal.screen.rows();
                 let col = (position.x.max(0.0) as usize / self.cell.width).min(cols - 1);
                 let row = (position.y.max(0.0) as usize / self.cell.height).min(rows - 1);
+                let old_cell = self.mouse_cell;
                 self.mouse_cell = row * cols + col;
+                if !self.modifiers.shift_key()
+                    && old_cell != self.mouse_cell
+                    && (self.terminal.mouse_mode == MouseMode::Motion
+                        || (self.terminal.mouse_mode == MouseMode::Drag
+                            && self.mouse_button.is_some()))
+                {
+                    self.send_mouse(self.mouse_button.unwrap_or(3) + 32, false);
+                }
                 if self.dragging {
                     if let Some((start, _)) = self.selection {
                         self.selection = Some((start, self.mouse_cell));
@@ -854,14 +920,27 @@ impl ApplicationHandler<UserEvent> for App {
                     self.window.as_ref().unwrap().request_redraw();
                 }
             }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => {
-                self.dragging = state == ElementState::Pressed;
-                if self.dragging {
-                    self.selection = Some((self.mouse_cell, self.mouse_cell));
+            WindowEvent::MouseInput { state, button, .. } => {
+                let code = match button {
+                    MouseButton::Left => Some(0),
+                    MouseButton::Middle => Some(1),
+                    MouseButton::Right => Some(2),
+                    _ => None,
+                };
+                if let Some(code) = code {
+                    let pressed = state == ElementState::Pressed;
+                    if self.terminal.mouse_mode != MouseMode::Off && !self.modifiers.shift_key() {
+                        self.send_mouse(code, !pressed);
+                        self.mouse_button = if pressed { Some(code) } else { None };
+                    } else if code == 0 {
+                        self.dragging = pressed;
+                        if pressed {
+                            self.selection = Some((self.mouse_cell, self.mouse_cell));
+                        }
+                    }
+                    if !pressed {
+                        self.mouse_button = None;
+                    }
                 }
                 self.window.as_ref().unwrap().request_redraw();
             }
@@ -872,6 +951,12 @@ impl ApplicationHandler<UserEvent> for App {
                         (position.y / self.cell.height as f64).round() as isize
                     }
                 };
+                if self.terminal.mouse_mode != MouseMode::Off && !self.modifiers.shift_key() {
+                    for _ in 0..lines.unsigned_abs().min(20) {
+                        self.send_mouse(if lines > 0 { 64 } else { 65 }, false);
+                    }
+                    return;
+                }
                 self.scroll_offset = self
                     .scroll_offset
                     .saturating_add_signed(lines)
@@ -894,6 +979,31 @@ impl ApplicationHandler<UserEvent> for App {
                 self.window.as_ref().unwrap().request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if self.terminal.application_keypad {
+                    let suffix = match event.physical_key {
+                        PhysicalKey::Code(KeyCode::Numpad0) => Some(b'p'),
+                        PhysicalKey::Code(KeyCode::Numpad1) => Some(b'q'),
+                        PhysicalKey::Code(KeyCode::Numpad2) => Some(b'r'),
+                        PhysicalKey::Code(KeyCode::Numpad3) => Some(b's'),
+                        PhysicalKey::Code(KeyCode::Numpad4) => Some(b't'),
+                        PhysicalKey::Code(KeyCode::Numpad5) => Some(b'u'),
+                        PhysicalKey::Code(KeyCode::Numpad6) => Some(b'v'),
+                        PhysicalKey::Code(KeyCode::Numpad7) => Some(b'w'),
+                        PhysicalKey::Code(KeyCode::Numpad8) => Some(b'x'),
+                        PhysicalKey::Code(KeyCode::Numpad9) => Some(b'y'),
+                        PhysicalKey::Code(KeyCode::NumpadEnter) => Some(b'M'),
+                        PhysicalKey::Code(KeyCode::NumpadAdd) => Some(b'k'),
+                        PhysicalKey::Code(KeyCode::NumpadSubtract) => Some(b'm'),
+                        PhysicalKey::Code(KeyCode::NumpadMultiply) => Some(b'j'),
+                        PhysicalKey::Code(KeyCode::NumpadDivide) => Some(b'o'),
+                        PhysicalKey::Code(KeyCode::NumpadDecimal) => Some(b'n'),
+                        _ => None,
+                    };
+                    if let Some(suffix) = suffix {
+                        self.send_input(vec![0x1b, b'O', suffix]);
+                        return;
+                    }
+                }
                 if self.modifiers.control_key()
                     && self.modifiers.shift_key()
                     && event.physical_key == PhysicalKey::Code(KeyCode::KeyC)
@@ -944,6 +1054,12 @@ impl ApplicationHandler<UserEvent> for App {
                 let was_alternate = self.terminal.is_alternate_screen();
                 self.parser
                     .advance(&bytes, |action| self.terminal.process(action));
+                for response in self.terminal.take_responses() {
+                    self.send_input(response);
+                }
+                if let Some(window) = &self.window {
+                    window.set_title(&self.terminal.title);
+                }
                 if was_alternate != self.terminal.is_alternate_screen() {
                     self.scroll_offset = 0;
                     self.selection = None;
@@ -1174,6 +1290,7 @@ fn rasterize(
             if scroll_offset == 0
                 && preedit.is_empty()
                 && terminal.cursor.visible
+                && terminal.cursor_shape == CursorShape::Block
                 && terminal.cursor.position.row == row
                 && terminal.cursor.position.col == col
             {
@@ -1212,6 +1329,7 @@ fn rasterize(
             if scroll_offset == 0
                 && preedit.is_empty()
                 && terminal.cursor.visible
+                && terminal.cursor_shape == CursorShape::Block
                 && terminal.cursor.position.row == row
                 && terminal.cursor.position.col == col
             {
@@ -1258,15 +1376,68 @@ fn rasterize(
                 }
             }
             if cell.attrs.underline != ruterm_core::attributes::UnderlineStyle::None {
+                use ruterm_core::attributes::UnderlineStyle;
+                let underline_fg = color(cell.attrs.underline_color, fg);
                 for x in 0..span * cell_size.width {
-                    put_pixel(
-                        pixels,
-                        width,
-                        col * cell_size.width + x,
-                        row * cell_size.height + cell_size.height.saturating_sub(2),
-                        fg,
-                    );
+                    let style = cell.attrs.underline;
+                    if (style == UnderlineStyle::Dotted && x % 3 != 0)
+                        || (style == UnderlineStyle::Dashed && x % 6 >= 4)
+                    {
+                        continue;
+                    }
+                    let baseline = ((row + 1) * cell_size.height).saturating_sub(2);
+                    let y = if style == UnderlineStyle::Curly {
+                        baseline.saturating_sub((x / 2) % 2)
+                    } else {
+                        baseline
+                    };
+                    put_pixel(pixels, width, col * cell_size.width + x, y, underline_fg);
+                    if style == UnderlineStyle::Double && cell_size.height >= 4 {
+                        put_pixel(
+                            pixels,
+                            width,
+                            col * cell_size.width + x,
+                            baseline - 2,
+                            underline_fg,
+                        );
+                    }
                 }
+            }
+        }
+    }
+    if scroll_offset == 0
+        && preedit.is_empty()
+        && terminal.cursor.visible
+        && terminal.cursor_shape != CursorShape::Block
+    {
+        let row = terminal.cursor.position.row;
+        let col = terminal.cursor.position.col;
+        if row < rows && col < cols {
+            let ink = [220, 220, 220];
+            match terminal.cursor_shape {
+                CursorShape::Underline => {
+                    for x in 0..cell_size.width {
+                        put_pixel(
+                            pixels,
+                            width,
+                            col * cell_size.width + x,
+                            (row + 1) * cell_size.height - 2,
+                            ink,
+                        );
+                    }
+                }
+                CursorShape::Bar => {
+                    for y in 0..cell_size.height {
+                        put_pixel(
+                            pixels,
+                            width,
+                            col * cell_size.width,
+                            row * cell_size.height + y,
+                            ink,
+                        );
+                    }
+                }
+                CursorShape::Block => {}
             }
         }
     }

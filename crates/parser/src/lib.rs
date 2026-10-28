@@ -2,7 +2,7 @@ mod action;
 mod sequence;
 mod utf8;
 
-pub use action::{Action, Csi, Dcs, Esc, Osc};
+pub use action::{Action, Csi, CsiParam, Dcs, Esc, Osc};
 use sequence::{CsiParser, DcsParser, EscParser, OscParser};
 use utf8::Utf8Decoder;
 
@@ -132,7 +132,7 @@ impl Parser {
                 self.state = State::CsiParam;
             }
             b';' | b':' => {
-                self.csi.finish_param();
+                self.csi.separator(byte);
                 self.state = State::CsiParam;
             }
             b'<' | b'=' | b'>' | b'?' => {
@@ -144,6 +144,9 @@ impl Parser {
                 }
             }
             0x20..=0x2f => {
+                if matches!(self.state, State::CsiParam) {
+                    self.csi.finish_param();
+                }
                 self.csi.push_intermediate(byte);
                 self.state = State::CsiIntermediate;
             }
@@ -242,7 +245,7 @@ impl Parser {
                 self.state = State::DcsParam;
             }
             b';' | b':' => {
-                self.dcs.header.finish_param();
+                self.dcs.header.separator(byte);
                 self.state = State::DcsParam;
             }
             b'<' | b'=' | b'>' | b'?' => {
@@ -421,7 +424,9 @@ mod tests {
             parse(b"\x1b[31m"),
             vec![Action::Csi(Csi {
                 private: None,
-                params: vec![Some(31)],
+                params: vec![CsiParam {
+                    subparams: vec![Some(31)]
+                }],
                 intermediates: vec![],
                 final_byte: b'm',
             }),],
@@ -434,10 +439,40 @@ mod tests {
             parse(b"\x1b[1;31;42m"),
             vec![Action::Csi(Csi {
                 private: None,
-                params: vec![Some(1), Some(31), Some(42),],
+                params: vec![
+                    CsiParam {
+                        subparams: vec![Some(1)]
+                    },
+                    CsiParam {
+                        subparams: vec![Some(31)]
+                    },
+                    CsiParam {
+                        subparams: vec![Some(42)]
+                    }
+                ],
                 intermediates: vec![],
                 final_byte: b'm',
             }),],
+        );
+    }
+
+    #[test]
+    fn groups_colon_subparameters_without_merging_semicolon_parameters() {
+        assert_eq!(
+            parse(b"\x1b[4:3;38:2::1:2:3m"),
+            vec![Action::Csi(Csi {
+                private: None,
+                params: vec![
+                    CsiParam {
+                        subparams: vec![Some(4), Some(3)]
+                    },
+                    CsiParam {
+                        subparams: vec![Some(38), Some(2), None, Some(1), Some(2), Some(3)]
+                    },
+                ],
+                intermediates: vec![],
+                final_byte: b'm',
+            })]
         );
     }
 
@@ -447,7 +482,14 @@ mod tests {
             parse(b"\x1b[;31m"),
             vec![Action::Csi(Csi {
                 private: None,
-                params: vec![None, Some(31),],
+                params: vec![
+                    CsiParam {
+                        subparams: vec![None]
+                    },
+                    CsiParam {
+                        subparams: vec![Some(31)]
+                    }
+                ],
                 intermediates: vec![],
                 final_byte: b'm',
             }),],
@@ -460,7 +502,9 @@ mod tests {
             parse(b"\x1b[?25h"),
             vec![Action::Csi(Csi {
                 private: Some(b'?'),
-                params: vec![Some(25)],
+                params: vec![CsiParam {
+                    subparams: vec![Some(25)]
+                }],
                 intermediates: vec![],
                 final_byte: b'h',
             }),],
@@ -503,7 +547,9 @@ mod tests {
             vec![
                 Action::Csi(Csi {
                     private: Some(b'?'),
-                    params: vec![Some(25)],
+                    params: vec![CsiParam {
+                        subparams: vec![Some(25)]
+                    }],
                     intermediates: vec![],
                     final_byte: b'h',
                 }),

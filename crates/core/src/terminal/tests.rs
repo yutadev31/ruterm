@@ -1,5 +1,5 @@
 use super::*;
-use crate::attributes::{Color, Flags};
+use crate::attributes::{Color, Flags, UnderlineStyle};
 use ruterm_parser::Parser;
 
 fn feed(terminal: &mut Terminal, input: &[u8]) {
@@ -12,6 +12,67 @@ fn row(terminal: &Terminal, index: usize) -> String {
         .iter()
         .map(|cell| cell.ch)
         .collect()
+}
+
+#[test]
+fn margins_origin_and_line_edits_stay_inside_region() {
+    let mut t = Terminal::new(4, 3);
+    feed(&mut t, b"aaa\r\nbbb\r\nccc\r\nddd");
+    feed(&mut t, b"\x1b[2;3r\x1b[?6h\x1b[2;1H\n");
+    assert_eq!(row(&t, 0), "aaa");
+    assert_eq!(row(&t, 1), "ccc");
+    assert_eq!(row(&t, 2), "   ");
+    assert_eq!(row(&t, 3), "ddd");
+    feed(&mut t, b"\x1b[1;1H\x1b[L");
+    assert_eq!(row(&t, 1), "   ");
+    assert_eq!(row(&t, 2), "ccc");
+}
+
+#[test]
+fn reports_position_status_and_identification() {
+    let mut t = Terminal::new(4, 5);
+    feed(&mut t, b"\x1b[2;3H\x1b[6n\x1b[5n\x1b[c\x1b[>c");
+    assert_eq!(
+        t.take_responses(),
+        vec![
+            b"\x1b[2;3R".to_vec(),
+            b"\x1b[0n".to_vec(),
+            b"\x1b[?1;2c".to_vec(),
+            b"\x1b[>0;0;0c".to_vec()
+        ]
+    );
+    assert!(t.take_responses().is_empty());
+}
+
+#[test]
+fn modes_graphics_title_and_extended_sgr() {
+    let mut t = Terminal::new(2, 5);
+    feed(&mut t, b"\x1b[?1;7;2004h\x1b[4h\x1b=\x1b[?1002;1006h\x1b[5 q\x1b]2;hello\x07\x1b(0lqk\x1b(B\x1b[4:3;38:2::1:2:3;58;5;42mX");
+    assert!(t.application_cursor && t.application_keypad && t.bracketed_paste && t.insert_mode);
+    assert_eq!(t.mouse_mode, MouseMode::Drag);
+    assert!(t.sgr_mouse);
+    assert_eq!(t.cursor_shape, CursorShape::Bar);
+    assert_eq!(t.title, "hello");
+    assert_eq!(row(&t, 0), "┌─┐X ");
+    assert_eq!(t.attrs.underline, UnderlineStyle::Curly);
+    assert_eq!(t.attrs.fg, Color::Rgb(1, 2, 3));
+    assert_eq!(t.attrs.underline_color, Color::Indexed(42));
+    feed(&mut t, b"\x1b[59m\x1b[3J");
+    assert_eq!(t.attrs.underline_color, Color::Default);
+    assert!(t.screen.scrollback.is_empty());
+}
+
+#[test]
+fn no_wrap_insert_and_scrollback_clear() {
+    let mut t = Terminal::new(2, 3);
+    feed(&mut t, b"abc\r\ndef\n");
+    assert!(!t.screen.scrollback.is_empty());
+    feed(&mut t, b"\x1b[3J\x1b[?7l\x1b[1;1HxyzQ");
+    assert!(t.screen.scrollback.is_empty());
+    assert_eq!(row(&t, 0), "xyQ");
+    assert_eq!(t.cursor.position.row, 0);
+    feed(&mut t, b"\r\x1b[4hZ");
+    assert_eq!(row(&t, 0), "Zxy");
 }
 
 #[test]

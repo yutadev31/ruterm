@@ -5,6 +5,7 @@ pub struct Attributes {
 
     pub flags: Flags,
     pub underline: UnderlineStyle,
+    pub underline_color: Color,
 }
 
 impl Default for Attributes {
@@ -14,6 +15,7 @@ impl Default for Attributes {
             bg: Color::Default,
             flags: Flags::empty(),
             underline: UnderlineStyle::None,
+            underline_color: Color::Default,
         }
     }
 }

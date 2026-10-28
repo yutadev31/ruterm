@@ -12,6 +12,7 @@ impl Terminal {
             0 => self.erase_range(index, len),
             1 => self.erase_range(0, index.saturating_add(1).min(len)),
             2 => self.erase_range(0, len),
+            3 => self.screen.scrollback.clear(),
             _ => {}
         }
     }
@@ -88,26 +89,17 @@ impl Terminal {
     }
 
     pub(super) fn insert_lines(&mut self, count: usize) {
-        let cols = self.screen.cols();
-        let start = self.cursor.position.row.saturating_mul(cols);
-        let end = self.screen.cells.len();
-        if cols == 0 || start >= end {
-            return;
+        let row = self.cursor.position.row;
+        if row >= self.scroll_top && row < self.scroll_bottom {
+            self.screen
+                .scroll_down_region(row, self.scroll_bottom, count);
         }
-        let n = count.min(self.screen.rows() - self.cursor.position.row) * cols;
-        self.screen.cells[start..end].rotate_right(n);
-        self.erase_range(start, start + n);
     }
 
     pub(super) fn delete_lines(&mut self, count: usize) {
-        let cols = self.screen.cols();
-        let start = self.cursor.position.row.saturating_mul(cols);
-        let end = self.screen.cells.len();
-        if cols == 0 || start >= end {
-            return;
+        let row = self.cursor.position.row;
+        if row >= self.scroll_top && row < self.scroll_bottom {
+            self.screen.scroll_up_region(row, self.scroll_bottom, count);
         }
-        let n = count.min(self.screen.rows() - self.cursor.position.row) * cols;
-        self.screen.cells[start..end].rotate_left(n);
-        self.erase_range(end - n, end);
     }
 }

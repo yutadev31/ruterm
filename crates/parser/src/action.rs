@@ -18,9 +18,14 @@ pub struct Esc {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Csi {
     pub private: Option<u8>,
-    pub params: Vec<Option<u16>>,
+    pub params: Vec<CsiParam>,
     pub intermediates: Vec<u8>,
     pub final_byte: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CsiParam {
+    pub subparams: Vec<Option<u16>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
