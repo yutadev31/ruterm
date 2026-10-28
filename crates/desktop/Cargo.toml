@@ -12,5 +12,6 @@ futures-lite.workspace = true
 ruterm-core.workspace = true
 ruterm-parser.workspace = true
 ruterm-pty.workspace = true
+toml.workspace = true
 wgpu.workspace = true
 winit.workspace = true

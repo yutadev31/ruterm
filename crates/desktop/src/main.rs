@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
@@ -21,11 +22,89 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 const COLS: usize = 80;
 const ROWS: usize = 24;
-const CELL_W: usize = 10;
-const CELL_H: usize = 20;
-const WIDTH: u32 = (COLS * CELL_W) as u32;
-const HEIGHT: u32 = (ROWS * CELL_H) as u32;
+const DEFAULT_FONT_SIZE: f32 = 17.0;
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+#[derive(Clone, Debug, PartialEq)]
+struct FontSettings {
+    name: String,
+    size: f32,
+}
+
+impl Default for FontSettings {
+    fn default() -> Self {
+        Self {
+            name: "monospace".into(),
+            size: DEFAULT_FONT_SIZE,
+        }
+    }
+}
+
+impl FontSettings {
+    fn from_toml(contents: &str) -> Result<Self, String> {
+        let config: toml::Value = contents.parse().map_err(|error| format!("{error}"))?;
+        let mut settings = Self::default();
+        if let Some(font) = config.get("font") {
+            let font = font.as_table().ok_or("[font] must be a table")?;
+            if let Some(name) = font.get("name") {
+                settings.name = name
+                    .as_str()
+                    .ok_or("font.name must be a string")?
+                    .to_owned();
+                if settings.name.trim().is_empty() {
+                    return Err("font.name must not be empty".into());
+                }
+            }
+            if let Some(size) = font.get("size") {
+                settings.size = size
+                    .as_float()
+                    .or_else(|| size.as_integer().map(|value| value as f64))
+                    .ok_or("font.size must be a number")? as f32;
+                if !settings.size.is_finite() || !(1.0..=128.0).contains(&settings.size) {
+                    return Err("font.size must be between 1 and 128".into());
+                }
+            }
+        }
+        Ok(settings)
+    }
+
+    fn load() -> Self {
+        let Some(home) = std::env::var_os("HOME") else {
+            return Self::default();
+        };
+        let path = PathBuf::from(home).join(".config/ruterm/config.toml");
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => match Self::from_toml(&contents) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    eprintln!("{}: {error}; using default font settings", path.display());
+                    Self::default()
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(error) => {
+                eprintln!("{}: {error}; using default font settings", path.display());
+                Self::default()
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CellSize {
+    width: usize,
+    height: usize,
+}
+
+impl CellSize {
+    fn for_font(settings: &FontSettings) -> Self {
+        let scale = settings.size / DEFAULT_FONT_SIZE;
+        Self {
+            width: (10.0 * scale).ceil() as usize,
+            height: (20.0 * scale).ceil() as usize,
+        }
+    }
+}
 
 enum UserEvent {
     Output(Vec<u8>, Sender<()>),
@@ -34,6 +113,7 @@ enum UserEvent {
 }
 
 struct Gpu {
+    cell: CellSize,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -48,7 +128,7 @@ struct Gpu {
 }
 
 impl Gpu {
-    fn new(window: Arc<Window>) -> Result<Self, String> {
+    fn new(window: Arc<Window>, cell: CellSize) -> Result<Self, String> {
         let size = window.inner_size();
         // Some Vulkan drivers crash while compiling this simple pipeline. Use the
         // OpenGL backend on Linux so a driver failure cannot abort the process.
@@ -92,8 +172,8 @@ impl Gpu {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("terminal pixels"),
             size: wgpu::Extent3d {
-                width: WIDTH,
-                height: HEIGHT,
+                width: (COLS * cell.width) as u32,
+                height: (ROWS * cell.height) as u32,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -175,6 +255,7 @@ impl Gpu {
             cache: None,
         });
         Ok(Self {
+            cell,
             surface,
             device,
             queue,
@@ -182,8 +263,8 @@ impl Gpu {
             texture,
             layout,
             sampler,
-            image_width: WIDTH,
-            image_height: HEIGHT,
+            image_width: (COLS * cell.width) as u32,
+            image_height: (ROWS * cell.height) as u32,
             bind_group,
             pipeline,
         })
@@ -199,8 +280,8 @@ impl Gpu {
     }
 
     fn resize_grid(&mut self, cols: usize, rows: usize) {
-        self.image_width = (cols * CELL_W) as u32;
-        self.image_height = (rows * CELL_H) as u32;
+        self.image_width = (cols * self.cell.width) as u32;
+        self.image_height = (rows * self.cell.height) as u32;
         self.texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("terminal pixels"),
             size: wgpu::Extent3d {
@@ -290,6 +371,8 @@ impl Gpu {
 }
 
 struct App {
+    cell: CellSize,
+    font_size: f32,
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
     fonts: Vec<FontVec>,
@@ -316,10 +399,13 @@ struct App {
 
 impl App {
     fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
+        let settings = FontSettings::load();
         Self {
+            cell: CellSize::for_font(&settings),
+            font_size: settings.size,
             window: None,
             gpu: None,
-            fonts: load_fonts(),
+            fonts: load_fonts(&settings.name),
             glyph_cache: HashMap::new(),
             pixels: Vec::new(),
             terminal: Terminal::new(ROWS, COLS),
@@ -375,8 +461,8 @@ impl App {
             size: PtySize {
                 rows: rows as u16,
                 cols: cols as u16,
-                pixel_width: (cols * CELL_W) as u16,
-                pixel_height: (rows * CELL_H) as u16,
+                pixel_width: (cols * self.cell.width) as u16,
+                pixel_height: (rows * self.cell.height) as u16,
             },
         };
         match Pty::spawn(options) {
@@ -485,8 +571,10 @@ impl App {
         if width == 0 || height == 0 {
             return;
         }
-        let cols = ((width as usize / CELL_W).max(1)).min(u16::MAX as usize / CELL_W);
-        let rows = ((height as usize / CELL_H).max(1)).min(u16::MAX as usize / CELL_H);
+        let cols =
+            ((width as usize / self.cell.width).max(1)).min(u16::MAX as usize / self.cell.width);
+        let rows =
+            ((height as usize / self.cell.height).max(1)).min(u16::MAX as usize / self.cell.height);
         if cols == self.terminal.screen.cols() && rows == self.terminal.screen.rows() {
             return;
         }
@@ -498,8 +586,8 @@ impl App {
             && let Err(error) = pty.resize(PtySize {
                 rows: rows as u16,
                 cols: cols as u16,
-                pixel_width: (cols * CELL_W) as u16,
-                pixel_height: (rows * CELL_H) as u16,
+                pixel_width: (cols * self.cell.width) as u16,
+                pixel_height: (rows * self.cell.height) as u16,
             })
         {
             self.message(&format!("PTY resize error: {error}"));
@@ -513,10 +601,10 @@ impl App {
             let cursor = self.terminal.cursor.position;
             window.set_ime_cursor_area(
                 winit::dpi::PhysicalPosition::new(
-                    (cursor.col * CELL_W) as i32,
-                    (cursor.row * CELL_H) as i32,
+                    (cursor.col * self.cell.width) as i32,
+                    (cursor.row * self.cell.height) as i32,
                 ),
-                winit::dpi::PhysicalSize::new(CELL_W as u32, CELL_H as u32),
+                winit::dpi::PhysicalSize::new(self.cell.width as u32, self.cell.height as u32),
             );
         }
     }
@@ -632,11 +720,14 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let attrs = WindowAttributes::default()
             .with_title("ruterm")
-            .with_inner_size(LogicalSize::new(WIDTH, HEIGHT));
+            .with_inner_size(LogicalSize::new(
+                (COLS * self.cell.width) as u32,
+                (ROWS * self.cell.height) as u32,
+            ));
         match event_loop.create_window(attrs) {
             Ok(window) => {
                 let window = Arc::new(window);
-                match Gpu::new(window.clone()) {
+                match Gpu::new(window.clone(), self.cell) {
                     Ok(gpu) => self.gpu = Some(gpu),
                     Err(error) => {
                         eprintln!("GPU initialization failed: {error}");
@@ -680,8 +771,8 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let cols = self.terminal.screen.cols();
                 let rows = self.terminal.screen.rows();
-                let col = (position.x.max(0.0) as usize / CELL_W).min(cols - 1);
-                let row = (position.y.max(0.0) as usize / CELL_H).min(rows - 1);
+                let col = (position.x.max(0.0) as usize / self.cell.width).min(cols - 1);
+                let row = (position.y.max(0.0) as usize / self.cell.height).min(rows - 1);
                 self.mouse_cell = row * cols + col;
                 if self.dragging {
                     if let Some((start, _)) = self.selection {
@@ -705,7 +796,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y.round() as isize * 3,
                     MouseScrollDelta::PixelDelta(position) => {
-                        (position.y / CELL_H as f64).round() as isize
+                        (position.y / self.cell.height as f64).round() as isize
                     }
                 };
                 self.scroll_offset = self
@@ -750,6 +841,8 @@ impl ApplicationHandler<UserEvent> for App {
                 rasterize(
                     &self.terminal,
                     &self.fonts,
+                    self.font_size,
+                    self.cell,
                     &mut self.glyph_cache,
                     &self.preedit,
                     self.scroll_offset,
@@ -816,8 +909,8 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
-fn load_fonts() -> Vec<FontVec> {
-    ["monospace", "sans:lang=ja"]
+fn load_fonts(name: &str) -> Vec<FontVec> {
+    [name, "sans:lang=ja"]
         .iter()
         .filter_map(|pattern| {
             let output = Command::new("fc-match")
@@ -838,11 +931,11 @@ struct GlyphBitmap {
     alpha: Vec<u8>,
 }
 
-fn glyph_bitmap(fonts: &[FontVec], ch: char) -> Option<GlyphBitmap> {
+fn glyph_bitmap(fonts: &[FontVec], ch: char, font_size: f32) -> Option<GlyphBitmap> {
     let font = fonts.iter().find(|font| font.glyph_id(ch).0 != 0)?;
     let glyph = font
         .glyph_id(ch)
-        .with_scale_and_position(PxScale::from(17.0), point(1.0, 16.0));
+        .with_scale_and_position(PxScale::from(font_size), point(1.0, font_size - 1.0));
     let outline = font.outline_glyph(glyph)?;
     let bounds = outline.px_bounds();
     let width = bounds.width() as usize;
@@ -862,6 +955,8 @@ fn glyph_bitmap(fonts: &[FontVec], ch: char) -> Option<GlyphBitmap> {
 fn rasterize(
     terminal: &Terminal,
     fonts: &[FontVec],
+    font_size: f32,
+    cell_size: CellSize,
     glyph_cache: &mut HashMap<char, Option<GlyphBitmap>>,
     preedit: &str,
     scroll_offset: usize,
@@ -870,8 +965,8 @@ fn rasterize(
 ) {
     let cols = terminal.screen.cols();
     let rows = terminal.screen.rows();
-    let width = cols * CELL_W;
-    pixels.resize(width * rows * CELL_H * 4, 0);
+    let width = cols * cell_size.width;
+    pixels.resize(width * rows * cell_size.height * 4, 0);
     let mut cells: Cow<'_, [ruterm_core::screen::Cell]> = if scroll_offset == 0 {
         Cow::Borrowed(&terminal.screen.cells)
     } else {
@@ -916,9 +1011,15 @@ fn rasterize(
             }) {
                 std::mem::swap(&mut fg, &mut bg);
             }
-            for y in 0..CELL_H {
-                for x in 0..CELL_W {
-                    put_pixel(pixels, width, col * CELL_W + x, row * CELL_H + y, bg);
+            for y in 0..cell_size.height {
+                for x in 0..cell_size.width {
+                    put_pixel(
+                        pixels,
+                        width,
+                        col * cell_size.width + x,
+                        row * cell_size.height + y,
+                        bg,
+                    );
                 }
             }
         }
@@ -956,7 +1057,7 @@ fn rasterize(
             for ch in std::iter::once(cell.ch).chain(cell.combining.chars()) {
                 let Some(bitmap) = glyph_cache
                     .entry(ch)
-                    .or_insert_with(|| glyph_bitmap(fonts, ch))
+                    .or_insert_with(|| glyph_bitmap(fonts, ch, font_size))
                 else {
                     continue;
                 };
@@ -966,12 +1067,12 @@ fn rasterize(
                         if alpha == 0.0 {
                             continue;
                         }
-                        let px = (col * CELL_W) as i32 + bitmap.x + x as i32;
-                        let py = (row * CELL_H) as i32 + bitmap.y + y as i32;
-                        if px >= (col * CELL_W) as i32
-                            && px < ((col + span) * CELL_W) as i32
-                            && py >= (row * CELL_H) as i32
-                            && py < ((row + 1) * CELL_H) as i32
+                        let px = (col * cell_size.width) as i32 + bitmap.x + x as i32;
+                        let py = (row * cell_size.height) as i32 + bitmap.y + y as i32;
+                        if px >= (col * cell_size.width) as i32
+                            && px < ((col + span) * cell_size.width) as i32
+                            && py >= (row * cell_size.height) as i32
+                            && py < ((row + 1) * cell_size.height) as i32
                         {
                             let mixed = std::array::from_fn(|i| {
                                 (fg[i] as f32 * alpha + bg[i] as f32 * (1.0 - alpha)) as u8
@@ -982,12 +1083,12 @@ fn rasterize(
                 }
             }
             if cell.attrs.underline != ruterm_core::attributes::UnderlineStyle::None {
-                for x in 0..span * CELL_W {
+                for x in 0..span * cell_size.width {
                     put_pixel(
                         pixels,
                         width,
-                        col * CELL_W + x,
-                        row * CELL_H + CELL_H - 2,
+                        col * cell_size.width + x,
+                        row * cell_size.height + cell_size.height.saturating_sub(2),
                         fg,
                     );
                 }
@@ -1053,6 +1154,22 @@ mod tests {
     use ruterm_core::screen::Cell;
 
     #[test]
+    fn parses_font_settings() {
+        let settings =
+            FontSettings::from_toml("[font]\nname = 'Noto Sans Mono'\nsize = 22.5\n").unwrap();
+        assert_eq!(settings.name, "Noto Sans Mono");
+        assert_eq!(settings.size, 22.5);
+        let cell = CellSize::for_font(&settings);
+        assert!(cell.width > 10 && cell.height > 20);
+        assert_eq!(
+            FontSettings::from_toml("[font]\nsize = 18\n").unwrap().name,
+            "monospace"
+        );
+        assert!(FontSettings::from_toml("[font]\nsize = 0\n").is_err());
+        assert!(FontSettings::from_toml("[font]\nname = ''\n").is_err());
+    }
+
+    #[test]
     fn control_keys_produce_terminal_bytes() {
         assert_eq!(control_byte(b'c'), Some(3));
         assert_eq!(control_byte(b'Z'), Some(26));
@@ -1091,6 +1208,8 @@ mod tests {
         rasterize(
             &terminal,
             &[],
+            DEFAULT_FONT_SIZE,
+            CellSize::for_font(&FontSettings::default()),
             &mut HashMap::new(),
             "",
             0,
@@ -1102,6 +1221,8 @@ mod tests {
         rasterize(
             &terminal,
             &[],
+            DEFAULT_FONT_SIZE,
+            CellSize::for_font(&FontSettings::default()),
             &mut HashMap::new(),
             "",
             0,
