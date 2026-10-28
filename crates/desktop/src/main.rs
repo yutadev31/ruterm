@@ -26,7 +26,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 const COLS: usize = 80;
 const ROWS: usize = 24;
-const DEFAULT_FONT_SIZE: f32 = 17.0;
+const DEFAULT_FONT_SIZE: f32 = 12.0;
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const OUTPUT_BUFFER_LIMIT: usize = 256 * 1024;
 
