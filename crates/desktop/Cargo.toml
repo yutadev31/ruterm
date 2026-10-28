@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 ab_glyph.workspace = true
 arboard = { workspace = true, default-features = false, features = ["wayland-data-control"] }
+cosmic-text.workspace = true
 futures-lite.workspace = true
 ruterm-core.workspace = true
 ruterm-parser.workspace = true

@@ -8,7 +8,11 @@ use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ab_glyph::{Font, FontVec, PxScale, point};
+use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
+use cosmic_text::{
+    Attrs, Buffer, Color as TextColor, Family, FontSystem, Metrics, Shaping, Style, SwashCache,
+    Weight, Wrap,
+};
 use ruterm_core::attributes::{Color, Flags};
 use ruterm_core::terminal::Terminal;
 use ruterm_parser::Parser;
@@ -97,11 +101,18 @@ struct CellSize {
 }
 
 impl CellSize {
-    fn for_font(settings: &FontSettings) -> Self {
-        let scale = settings.size / DEFAULT_FONT_SIZE;
+    fn for_font(font: &FontVec, size: f32) -> Self {
+        let scaled = font.as_scaled(PxScale::from(size));
+        let advance = ['M', '0', 'W']
+            .into_iter()
+            .map(|ch| scaled.h_advance(font.glyph_id(ch)))
+            .fold(0.0_f32, f32::max);
         Self {
-            width: (10.0 * scale).ceil() as usize,
-            height: (20.0 * scale).ceil() as usize,
+            width: advance.ceil().max(1.0) as usize + 2,
+            height: (scaled.ascent() - scaled.descent() + scaled.line_gap())
+                .ceil()
+                .max(size.ceil()) as usize
+                + 2,
         }
     }
 }
@@ -371,12 +382,12 @@ impl Gpu {
 }
 
 struct App {
+    font_settings: FontSettings,
     cell: CellSize,
-    font_size: f32,
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
     fonts: Vec<FontVec>,
-    glyph_cache: HashMap<char, Option<GlyphBitmap>>,
+    text_renderer: TextRenderer,
     pixels: Vec<u8>,
     terminal: Terminal,
     parser: Parser,
@@ -400,13 +411,21 @@ struct App {
 impl App {
     fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
         let settings = FontSettings::load();
+        let fonts = load_fonts(&settings.name);
+        let cell = fonts.first().map_or(
+            CellSize {
+                width: 10,
+                height: 20,
+            },
+            |font| CellSize::for_font(font, settings.size),
+        );
         Self {
-            cell: CellSize::for_font(&settings),
-            font_size: settings.size,
+            font_settings: settings.clone(),
+            cell,
             window: None,
             gpu: None,
-            fonts: load_fonts(&settings.name),
-            glyph_cache: HashMap::new(),
+            fonts,
+            text_renderer: TextRenderer::new(&settings, cell),
             pixels: Vec::new(),
             terminal: Terminal::new(ROWS, COLS),
             parser: Parser::default(),
@@ -596,6 +615,19 @@ impl App {
         self.scroll_offset = 0;
     }
 
+    fn scale_text(&mut self, scale_factor: f64) {
+        let mut settings = self.font_settings.clone();
+        settings.size *= scale_factor as f32;
+        if let Some(font) = self.fonts.first() {
+            self.cell = CellSize::for_font(font, settings.size);
+        }
+        self.text_renderer = TextRenderer::new(&settings, self.cell);
+        if let Some(gpu) = &mut self.gpu {
+            gpu.cell = self.cell;
+            gpu.resize_grid(self.terminal.screen.cols(), self.terminal.screen.rows());
+        }
+    }
+
     fn update_ime_area(&self) {
         if let Some(window) = &self.window {
             let cursor = self.terminal.cursor.position;
@@ -727,6 +759,7 @@ impl ApplicationHandler<UserEvent> for App {
         match event_loop.create_window(attrs) {
             Ok(window) => {
                 let window = Arc::new(window);
+                self.scale_text(window.scale_factor());
                 match Gpu::new(window.clone(), self.cell) {
                     Ok(gpu) => self.gpu = Some(gpu),
                     Err(error) => {
@@ -766,6 +799,12 @@ impl ApplicationHandler<UserEvent> for App {
                     self.resize_grid(size.width, size.height);
                     self.window.as_ref().unwrap().request_redraw();
                 }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.scale_text(scale_factor);
+                let size = self.window.as_ref().unwrap().inner_size();
+                self.resize_grid(size.width, size.height);
+                self.window.as_ref().unwrap().request_redraw();
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::CursorMoved { position, .. } => {
@@ -840,10 +879,8 @@ impl ApplicationHandler<UserEvent> for App {
                 self.update_ime_area();
                 rasterize(
                     &self.terminal,
-                    &self.fonts,
-                    self.font_size,
                     self.cell,
-                    &mut self.glyph_cache,
+                    &mut self.text_renderer,
                     &self.preedit,
                     self.scroll_offset,
                     self.selection,
@@ -923,41 +960,129 @@ fn load_fonts(name: &str) -> Vec<FontVec> {
         .collect()
 }
 
-struct GlyphBitmap {
-    x: i32,
-    y: i32,
-    width: usize,
-    height: usize,
-    alpha: Vec<u8>,
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct TextKey {
+    text: String,
+    span: usize,
+    bold: bool,
+    italic: bool,
 }
 
-fn glyph_bitmap(fonts: &[FontVec], ch: char, font_size: f32) -> Option<GlyphBitmap> {
-    let font = fonts.iter().find(|font| font.glyph_id(ch).0 != 0)?;
-    let glyph = font
-        .glyph_id(ch)
-        .with_scale_and_position(PxScale::from(font_size), point(1.0, font_size - 1.0));
-    let outline = font.outline_glyph(glyph)?;
-    let bounds = outline.px_bounds();
-    let width = bounds.width() as usize;
-    let height = bounds.height() as usize;
-    let mut alpha = vec![0; width * height];
-    outline
-        .draw(|x, y, coverage| alpha[y as usize * width + x as usize] = (coverage * 255.0) as u8);
-    Some(GlyphBitmap {
-        x: bounds.min.x as i32,
-        y: bounds.min.y as i32,
-        width,
-        height,
-        alpha,
-    })
+struct CellGlyph {
+    width: usize,
+    height: usize,
+    rgba: Vec<u8>,
+}
+
+struct TextRenderer {
+    font_system: FontSystem,
+    swash_cache: SwashCache,
+    glyphs: HashMap<TextKey, CellGlyph>,
+    family: String,
+    font_size: f32,
+    cell: CellSize,
+}
+
+impl TextRenderer {
+    fn new(settings: &FontSettings, cell: CellSize) -> Self {
+        let family = Command::new("fc-match")
+            .args(["-f", "%{family}", &settings.name])
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .and_then(|names| names.split(',').next().map(str::to_owned))
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| settings.name.clone());
+        Self {
+            font_system: FontSystem::new(),
+            swash_cache: SwashCache::new(),
+            glyphs: HashMap::new(),
+            family,
+            font_size: settings.size,
+            cell,
+        }
+    }
+
+    fn glyph(&mut self, text: &str, span: usize, flags: Flags) -> &CellGlyph {
+        let key = TextKey {
+            text: text.to_owned(),
+            span,
+            bold: flags.contains(Flags::BOLD),
+            italic: flags.contains(Flags::ITALIC),
+        };
+        if !self.glyphs.contains_key(&key) {
+            if self.glyphs.len() >= 4096 {
+                self.glyphs.clear();
+            }
+            let glyph = self.shape_glyph(&key);
+            self.glyphs.insert(key.clone(), glyph);
+        }
+        &self.glyphs[&key]
+    }
+
+    fn shape_glyph(&mut self, key: &TextKey) -> CellGlyph {
+        let width = self.cell.width * key.span;
+        let height = self.cell.height;
+        let mut rgba = vec![0; width * height * 4];
+        let mut buffer = Buffer::new_empty(Metrics::new(self.font_size, height as f32));
+        buffer.set_wrap(Wrap::None);
+        let attrs = Attrs::new()
+            .family(Family::Name(&self.family))
+            .weight(if key.bold {
+                Weight::BOLD
+            } else {
+                Weight::NORMAL
+            })
+            .style(if key.italic {
+                Style::Italic
+            } else {
+                Style::Normal
+            });
+        buffer.set_text(&key.text, &attrs, Shaping::Advanced, None);
+        buffer.shape_until_scroll(&mut self.font_system, false);
+        let advance = buffer
+            .layout_runs()
+            .flat_map(|run| run.glyphs.iter())
+            .map(|glyph| glyph.x + glyph.w)
+            .fold(0.0_f32, f32::max);
+        let x_offset = ((width as f32 - advance) / 2.0).round() as i32;
+        buffer.draw(
+            &mut self.font_system,
+            &mut self.swash_cache,
+            TextColor::rgb(255, 255, 255),
+            |x, y, _w, _h, color| {
+                let x = x + x_offset;
+                if x < 0 || x >= width as i32 || y < 0 || y >= height as i32 {
+                    return;
+                }
+                let offset = (y as usize * width + x as usize) * 4;
+                let [r, g, b, a] = color.as_rgba();
+                let old_a = rgba[offset + 3] as u16;
+                let new_a = a as u16 + old_a * (255 - a as u16) / 255;
+                if new_a == 0 {
+                    return;
+                }
+                for (channel, source) in [r, g, b].into_iter().enumerate() {
+                    let old = rgba[offset + channel] as u16;
+                    rgba[offset + channel] = ((source as u16 * a as u16
+                        + old * old_a * (255 - a as u16) / 255)
+                        / new_a) as u8;
+                }
+                rgba[offset + 3] = new_a as u8;
+            },
+        );
+        CellGlyph {
+            width,
+            height,
+            rgba,
+        }
+    }
 }
 
 fn rasterize(
     terminal: &Terminal,
-    fonts: &[FontVec],
-    font_size: f32,
     cell_size: CellSize,
-    glyph_cache: &mut HashMap<char, Option<GlyphBitmap>>,
+    text_renderer: &mut TextRenderer,
     preedit: &str,
     scroll_offset: usize,
     selection: Option<(usize, usize)>,
@@ -1027,7 +1152,7 @@ fn rasterize(
     for row in 0..rows {
         for col in 0..cols {
             let cell = &cells[row * cols + col];
-            if cell.wide_continuation || (cell.ch == ' ' && cell.combining.is_empty()) {
+            if cell.wide_continuation {
                 continue;
             }
             let mut fg = color(cell.attrs.fg, [220, 220, 220]);
@@ -1054,30 +1179,31 @@ fn rasterize(
             } else {
                 1
             };
-            for ch in std::iter::once(cell.ch).chain(cell.combining.chars()) {
-                let Some(bitmap) = glyph_cache
-                    .entry(ch)
-                    .or_insert_with(|| glyph_bitmap(fonts, ch, font_size))
-                else {
-                    continue;
-                };
-                for y in 0..bitmap.height {
-                    for x in 0..bitmap.width {
-                        let alpha = bitmap.alpha[y * bitmap.width + x] as f32 / 255.0;
-                        if alpha == 0.0 {
+            if !cell.attrs.flags.contains(Flags::HIDDEN)
+                && (cell.ch != ' ' || !cell.combining.is_empty())
+            {
+                let mut text = cell.ch.to_string();
+                text.push_str(&cell.combining);
+                let glyph = text_renderer.glyph(&text, span, cell.attrs.flags);
+                for y in 0..glyph.height {
+                    for x in 0..glyph.width {
+                        let source = (y * glyph.width + x) * 4;
+                        let alpha = glyph.rgba[source + 3] as u16;
+                        if alpha == 0 {
                             continue;
                         }
-                        let px = (col * cell_size.width) as i32 + bitmap.x + x as i32;
-                        let py = (row * cell_size.height) as i32 + bitmap.y + y as i32;
-                        if px >= (col * cell_size.width) as i32
-                            && px < ((col + span) * cell_size.width) as i32
-                            && py >= (row * cell_size.height) as i32
-                            && py < ((row + 1) * cell_size.height) as i32
-                        {
-                            let mixed = std::array::from_fn(|i| {
-                                (fg[i] as f32 * alpha + bg[i] as f32 * (1.0 - alpha)) as u8
-                            });
-                            put_pixel(pixels, width, px as usize, py as usize, mixed);
+                        let target =
+                            ((row * cell_size.height + y) * width + col * cell_size.width + x) * 4;
+                        let color_glyph = glyph.rgba[source..source + 3] != [255, 255, 255];
+                        for channel in 0..3 {
+                            let ink = if color_glyph {
+                                glyph.rgba[source + channel]
+                            } else {
+                                fg[channel]
+                            };
+                            pixels[target + channel] = ((ink as u16 * alpha
+                                + pixels[target + channel] as u16 * (255 - alpha))
+                                / 255) as u8;
                         }
                     }
                 }
@@ -1159,8 +1285,6 @@ mod tests {
             FontSettings::from_toml("[font]\nname = 'Noto Sans Mono'\nsize = 22.5\n").unwrap();
         assert_eq!(settings.name, "Noto Sans Mono");
         assert_eq!(settings.size, 22.5);
-        let cell = CellSize::for_font(&settings);
-        assert!(cell.width > 10 && cell.height > 20);
         assert_eq!(
             FontSettings::from_toml("[font]\nsize = 18\n").unwrap().name,
             "monospace"
@@ -1205,31 +1329,65 @@ mod tests {
             },
         );
         let mut pixels = Vec::new();
-        rasterize(
-            &terminal,
-            &[],
-            DEFAULT_FONT_SIZE,
-            CellSize::for_font(&FontSettings::default()),
-            &mut HashMap::new(),
-            "",
-            0,
-            None,
-            &mut pixels,
-        );
+        let cell = CellSize {
+            width: 10,
+            height: 20,
+        };
+        let mut renderer = TextRenderer::new(&FontSettings::default(), cell);
+        rasterize(&terminal, cell, &mut renderer, "", 0, None, &mut pixels);
         assert_eq!(&pixels[..4], &[4, 5, 6, 255]);
         terminal.cursor.visible = true;
-        rasterize(
-            &terminal,
-            &[],
-            DEFAULT_FONT_SIZE,
-            CellSize::for_font(&FontSettings::default()),
-            &mut HashMap::new(),
-            "",
-            0,
-            None,
-            &mut pixels,
-        );
+        rasterize(&terminal, cell, &mut renderer, "", 0, None, &mut pixels);
         assert_eq!(&pixels[..4], &[220, 220, 220, 255]);
+    }
+
+    #[test]
+    fn shapes_latin_cjk_and_combining_text() {
+        let Some(font) = load_fonts("monospace").into_iter().next() else {
+            return;
+        };
+        let cell = CellSize::for_font(&font, DEFAULT_FONT_SIZE);
+        let mut renderer = TextRenderer::new(&FontSettings::default(), cell);
+        for (text, span) in [("A", 1), ("日", 2), ("e\u{301}", 1)] {
+            let glyph = renderer.glyph(text, span, Flags::empty());
+            assert_eq!(glyph.width, cell.width * span);
+            assert_eq!(glyph.height, cell.height);
+            assert!(
+                glyph.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn rasterizes_text_with_cell_foreground_color() {
+        let Some(font) = load_fonts("monospace").into_iter().next() else {
+            return;
+        };
+        let cell = CellSize::for_font(&font, DEFAULT_FONT_SIZE);
+        let mut terminal = Terminal::new(1, 1);
+        terminal.cursor.visible = false;
+        terminal.screen.set_cell(
+            0,
+            0,
+            Cell {
+                ch: 'A',
+                attrs: Attributes {
+                    fg: Color::Rgb(255, 0, 0),
+                    bg: Color::Rgb(0, 0, 0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let mut pixels = Vec::new();
+        let mut renderer = TextRenderer::new(&FontSettings::default(), cell);
+        rasterize(&terminal, cell, &mut renderer, "", 0, None, &mut pixels);
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] > 0 && pixel[1] == 0 && pixel[2] == 0)
+        );
     }
 
     #[test]
