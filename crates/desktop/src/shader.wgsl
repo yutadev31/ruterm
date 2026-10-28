@@ -17,5 +17,10 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOut {
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    return textureSample(terminal_texture, terminal_sampler, in.uv);
+    let pixel = vec2<i32>(in.position.xy);
+    let size = vec2<i32>(textureDimensions(terminal_texture));
+    if (pixel.x >= size.x || pixel.y >= size.y) {
+        return vec4(0.0, 0.0, 0.0, 1.0);
+    }
+    return textureLoad(terminal_texture, pixel, 0);
 }
