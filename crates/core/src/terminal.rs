@@ -1,7 +1,7 @@
 use ruterm_parser::{Action, Csi, Esc, Osc};
 
 use crate::{
-    attributes::Attributes,
+    attributes::{Attributes, Color, Flags, UnderlineStyle},
     common::Position,
     screen::{Cell, Screen},
 };
@@ -11,9 +11,25 @@ pub struct Terminal {
     pub screen: Screen,
     pub cursor: Cursor,
     pub attrs: Attributes,
+    saved_cursor: Option<(Position, Attributes)>,
+    tab_stops: Vec<bool>,
 }
 
 impl Terminal {
+    pub fn new(rows: usize, cols: usize) -> Self {
+        Self {
+            screen: Screen::new(rows, cols),
+            cursor: Cursor {
+                position: Position::default(),
+                pending_wrap: false,
+                visible: true,
+            },
+            attrs: Attributes::default(),
+            saved_cursor: None,
+            tab_stops: (0..cols).map(|col| col != 0 && col % 8 == 0).collect(),
+        }
+    }
+
     pub fn process(&mut self, action: Action) {
         match action {
             Action::Print(ch) => self.print(ch),
@@ -25,14 +41,15 @@ impl Terminal {
     }
 
     fn print(&mut self, ch: char) {
+        if self.screen.rows() == 0 || self.screen.cols() == 0 {
+            return;
+        }
         if self.cursor.pending_wrap {
             self.wrap_line();
-            self.cursor.pending_wrap = false;
         }
-
-        let row = self.cursor.position.row;
-        let col = self.cursor.position.col;
-
+        let row = self.cursor.position.row.min(self.screen.rows() - 1);
+        let col = self.cursor.position.col.min(self.screen.cols() - 1);
+        self.cursor.position = Position { row, col };
         self.screen.set_cell(
             row,
             col,
@@ -41,7 +58,6 @@ impl Terminal {
                 attrs: self.attrs,
             },
         );
-
         if col + 1 == self.screen.cols() {
             self.cursor.pending_wrap = true;
         } else {
@@ -55,35 +71,116 @@ impl Terminal {
             b'\x09' => self.tab(),
             b'\x0a' | b'\x0b' | b'\x0c' => self.line_feed(),
             b'\x0d' => self.carriage_return(),
-            _ => {}
+            _ => return,
         }
-
         self.cursor.pending_wrap = false;
     }
 
     fn esc(&mut self, esc: Esc) {
-        match (&esc.intermediates, esc.final_byte) {
-            (&[0, 0], b'D') => self.index(),
-            (&[0, 0], b'E') => self.next_line(),
-            (&[0, 0], b'M') => self.reverse_index(),
+        if esc.intermediate_len != 0 {
+            return;
+        }
+        match esc.final_byte {
+            b'D' => self.index(),
+            b'E' => self.next_line(),
+            b'M' => self.reverse_index(),
+            b'7' => self.save_cursor(),
+            b'8' => self.restore_cursor(),
+            b'H' => self.set_tab_stop(),
+            b'c' => self.reset(),
+            _ => return,
+        }
+        self.cursor.pending_wrap = false;
+    }
 
-            (&[0, 0], b'7') => self.save_cursor(),
-            (&[0, 0], b'8') => self.restore_cursor(),
-
-            (&[0, 0], b'H') => self.set_tab_stop(),
-            (&[0, 0], b'c') => self.reset(),
-
-            _ => {}
+    fn csi(&mut self, csi: Csi) {
+        if !csi.intermediates.is_empty() {
+            return;
+        }
+        if csi.private == Some(b'?') {
+            if matches!(csi.final_byte, b'h' | b'l') && csi.params.contains(&Some(25)) {
+                self.cursor.visible = csi.final_byte == b'h';
+            }
+            return;
+        }
+        if csi.private.is_some() {
+            return;
+        }
+        let n = param_count(&csi, 0);
+        let rows = self.screen.rows();
+        let cols = self.screen.cols();
+        match csi.final_byte {
+            b'A' => self.cursor.position.row = self.cursor.position.row.saturating_sub(n),
+            b'B' | b'e' => {
+                self.cursor.position.row = self
+                    .cursor
+                    .position
+                    .row
+                    .saturating_add(n)
+                    .min(rows.saturating_sub(1))
+            }
+            b'C' | b'a' => {
+                self.cursor.position.col = self
+                    .cursor
+                    .position
+                    .col
+                    .saturating_add(n)
+                    .min(cols.saturating_sub(1))
+            }
+            b'D' => self.cursor.position.col = self.cursor.position.col.saturating_sub(n),
+            b'E' => {
+                self.cursor.position.row = self
+                    .cursor
+                    .position
+                    .row
+                    .saturating_add(n)
+                    .min(rows.saturating_sub(1));
+                self.cursor.position.col = 0;
+            }
+            b'F' => {
+                self.cursor.position.row = self.cursor.position.row.saturating_sub(n);
+                self.cursor.position.col = 0;
+            }
+            b'G' | b'`' => {
+                self.cursor.position.col = n.saturating_sub(1).min(cols.saturating_sub(1))
+            }
+            b'd' => self.cursor.position.row = n.saturating_sub(1).min(rows.saturating_sub(1)),
+            b'H' | b'f' => {
+                self.cursor.position.row = param_count(&csi, 0)
+                    .saturating_sub(1)
+                    .min(rows.saturating_sub(1));
+                self.cursor.position.col = param_count(&csi, 1)
+                    .saturating_sub(1)
+                    .min(cols.saturating_sub(1));
+            }
+            b'J' => self.erase_display(param(&csi, 0)),
+            b'K' => self.erase_line(param(&csi, 0)),
+            b'X' => self.erase_chars(n),
+            b'@' => self.insert_chars(n),
+            b'P' => self.delete_chars(n),
+            b'L' => self.insert_lines(n),
+            b'M' => self.delete_lines(n),
+            b'S' => self.screen.scroll_up(n),
+            b'T' => self.screen.scroll_down(n),
+            b'I' => self.move_tabs(n, true),
+            b'Z' => self.move_tabs(n, false),
+            b'g' => self.clear_tab_stops(param(&csi, 0)),
+            b'm' => self.sgr(&csi.params),
+            b's' => self.save_cursor(),
+            b'u' => self.restore_cursor(),
+            _ => return,
+        }
+        if !matches!(csi.final_byte, b'm' | b'g') {
+            self.cursor.pending_wrap = false;
         }
     }
 
-    fn csi(&mut self, csi: Csi) {}
-
-    fn osc(&mut self, osc: Osc) {}
+    fn osc(&mut self, _osc: Osc) {}
 
     fn wrap_line(&mut self) {
         self.cursor.position.col = 0;
         self.line_feed();
+        self.cursor.pending_wrap = false;
     }
 
     fn backspace(&mut self) {
@@ -91,7 +188,24 @@ impl Terminal {
     }
 
     fn tab(&mut self) {
-        todo!()
+        self.move_tabs(1, true);
+    }
+
+    fn move_tabs(&mut self, count: usize, forward: bool) {
+        for _ in 0..count {
+            let col = self.cursor.position.col;
+            let stop = if forward {
+                (col.saturating_add(1)..self.tab_stops.len())
+                    .find(|&i| self.tab_stops[i])
+                    .unwrap_or(self.screen.cols().saturating_sub(1))
+            } else {
+                (0..col.min(self.tab_stops.len()))
+                    .rev()
+                    .find(|&i| self.tab_stops[i])
+                    .unwrap_or(0)
+            };
+            self.cursor.position.col = stop;
+        }
     }
 
     fn line_feed(&mut self) {
@@ -107,38 +221,330 @@ impl Terminal {
     }
 
     fn index(&mut self) {
-        todo!()
+        self.line_feed();
     }
 
     fn next_line(&mut self) {
-        todo!()
+        self.line_feed();
+        self.carriage_return();
     }
 
     fn reverse_index(&mut self) {
-        todo!()
+        if self.cursor.position.row == 0 {
+            self.screen.scroll_down(1);
+        } else {
+            self.cursor.position.row -= 1;
+        }
     }
 
     fn save_cursor(&mut self) {
-        todo!()
+        self.saved_cursor = Some((self.cursor.position, self.attrs));
     }
 
     fn restore_cursor(&mut self) {
-        todo!()
+        if let Some((position, attrs)) = self.saved_cursor {
+            self.cursor.position = Position {
+                row: position.row.min(self.screen.rows().saturating_sub(1)),
+                col: position.col.min(self.screen.cols().saturating_sub(1)),
+            };
+            self.attrs = attrs;
+        }
     }
 
     fn set_tab_stop(&mut self) {
-        todo!()
+        if let Some(stop) = self.tab_stops.get_mut(self.cursor.position.col) {
+            *stop = true;
+        }
+    }
+
+    fn clear_tab_stops(&mut self, mode: u16) {
+        match mode {
+            0 => {
+                if let Some(stop) = self.tab_stops.get_mut(self.cursor.position.col) {
+                    *stop = false;
+                }
+            }
+            3 => self.tab_stops.fill(false),
+            _ => {}
+        }
     }
 
     fn reset(&mut self) {
-        todo!()
+        self.screen.clear();
+        self.cursor = Cursor {
+            position: Position::default(),
+            pending_wrap: false,
+            visible: true,
+        };
+        self.attrs = Attributes::default();
+        self.saved_cursor = None;
+        self.tab_stops = (0..self.screen.cols())
+            .map(|col| col != 0 && col % 8 == 0)
+            .collect();
     }
+
+    fn erase_display(&mut self, mode: u16) {
+        let cols = self.screen.cols();
+        let row = self.cursor.position.row;
+        let col = self.cursor.position.col;
+        let len = self.screen.cells.len();
+        let index = row.saturating_mul(cols).saturating_add(col).min(len);
+        match mode {
+            0 => self.erase_range(index, len),
+            1 => self.erase_range(0, index.saturating_add(1).min(len)),
+            2 => self.erase_range(0, len),
+            _ => {}
+        }
+    }
+
+    fn erase_line(&mut self, mode: u16) {
+        let cols = self.screen.cols();
+        let start = self.cursor.position.row.saturating_mul(cols);
+        let end = start.saturating_add(cols).min(self.screen.cells.len());
+        let index = start.saturating_add(self.cursor.position.col).min(end);
+        match mode {
+            0 => self.erase_range(index, end),
+            1 => self.erase_range(start, index.saturating_add(1).min(end)),
+            2 => self.erase_range(start, end),
+            _ => {}
+        }
+    }
+
+    fn erase_chars(&mut self, count: usize) {
+        let start = self
+            .cursor
+            .position
+            .row
+            .saturating_mul(self.screen.cols())
+            .saturating_add(self.cursor.position.col);
+        let end = (start.saturating_add(count))
+            .min((self.cursor.position.row + 1).saturating_mul(self.screen.cols()));
+        self.erase_range(start, end);
+    }
+
+    fn erase_range(&mut self, start: usize, end: usize) {
+        let end = end.min(self.screen.cells.len());
+        if start < end {
+            self.screen.cells[start..end].fill(Cell {
+                ch: ' ',
+                attrs: self.attrs,
+            });
+        }
+    }
+
+    fn insert_chars(&mut self, count: usize) {
+        let cols = self.screen.cols();
+        let start = self
+            .cursor
+            .position
+            .row
+            .saturating_mul(cols)
+            .saturating_add(self.cursor.position.col);
+        let end = (self.cursor.position.row + 1).saturating_mul(cols);
+        if start >= end || end > self.screen.cells.len() {
+            return;
+        }
+        let n = count.min(end - start);
+        self.screen.cells.copy_within(start..end - n, start + n);
+        self.erase_range(start, start + n);
+    }
+
+    fn delete_chars(&mut self, count: usize) {
+        let cols = self.screen.cols();
+        let start = self
+            .cursor
+            .position
+            .row
+            .saturating_mul(cols)
+            .saturating_add(self.cursor.position.col);
+        let end = (self.cursor.position.row + 1).saturating_mul(cols);
+        if start >= end || end > self.screen.cells.len() {
+            return;
+        }
+        let n = count.min(end - start);
+        self.screen.cells.copy_within(start + n..end, start);
+        self.erase_range(end - n, end);
+    }
+
+    fn insert_lines(&mut self, count: usize) {
+        let cols = self.screen.cols();
+        let start = self.cursor.position.row.saturating_mul(cols);
+        let end = self.screen.cells.len();
+        if cols == 0 || start >= end {
+            return;
+        }
+        let n = count.min(self.screen.rows() - self.cursor.position.row) * cols;
+        self.screen.cells.copy_within(start..end - n, start + n);
+        self.erase_range(start, start + n);
+    }
+
+    fn delete_lines(&mut self, count: usize) {
+        let cols = self.screen.cols();
+        let start = self.cursor.position.row.saturating_mul(cols);
+        let end = self.screen.cells.len();
+        if cols == 0 || start >= end {
+            return;
+        }
+        let n = count.min(self.screen.rows() - self.cursor.position.row) * cols;
+        self.screen.cells.copy_within(start + n..end, start);
+        self.erase_range(end - n, end);
+    }
+
+    fn sgr(&mut self, params: &[Option<u16>]) {
+        let values: Vec<u16> = if params.is_empty() {
+            vec![0]
+        } else {
+            params.iter().map(|p| p.unwrap_or(0)).collect()
+        };
+        let mut i = 0;
+        while i < values.len() {
+            let code = values[i];
+            match code {
+                0 => self.attrs = Attributes::default(),
+                1 => self.attrs.flags.insert(Flags::BOLD),
+                2 => self.attrs.flags.insert(Flags::FAINT),
+                3 => self.attrs.flags.insert(Flags::ITALIC),
+                4 => self.attrs.underline = UnderlineStyle::Single,
+                5 | 6 => self.attrs.flags.insert(Flags::BLINK),
+                7 => self.attrs.flags.insert(Flags::INVERSE),
+                8 => self.attrs.flags.insert(Flags::HIDDEN),
+                9 => self.attrs.flags.insert(Flags::STRIKETHROUGH),
+                21 => self.attrs.underline = UnderlineStyle::Double,
+                22 => self.attrs.flags.remove(Flags::BOLD | Flags::FAINT),
+                23 => self.attrs.flags.remove(Flags::ITALIC),
+                24 => self.attrs.underline = UnderlineStyle::None,
+                25 => self.attrs.flags.remove(Flags::BLINK),
+                27 => self.attrs.flags.remove(Flags::INVERSE),
+                28 => self.attrs.flags.remove(Flags::HIDDEN),
+                29 => self.attrs.flags.remove(Flags::STRIKETHROUGH),
+                30..=37 => self.attrs.fg = Color::Indexed((code - 30) as u8),
+                40..=47 => self.attrs.bg = Color::Indexed((code - 40) as u8),
+                90..=97 => self.attrs.fg = Color::Indexed((code - 90 + 8) as u8),
+                100..=107 => self.attrs.bg = Color::Indexed((code - 100 + 8) as u8),
+                39 => self.attrs.fg = Color::Default,
+                49 => self.attrs.bg = Color::Default,
+                38 | 48 => {
+                    if let Some((color, consumed)) = parse_extended_color(&values[i + 1..]) {
+                        if code == 38 {
+                            self.attrs.fg = color;
+                        } else {
+                            self.attrs.bg = color;
+                        }
+                        i += consumed;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+}
+
+fn parse_extended_color(values: &[u16]) -> Option<(Color, usize)> {
+    match values {
+        [5, index, ..] if *index <= 255 => Some((Color::Indexed(*index as u8), 2)),
+        [2, r, g, b, ..] if *r <= 255 && *g <= 255 && *b <= 255 => {
+            Some((Color::Rgb(*r as u8, *g as u8, *b as u8), 4))
+        }
+        _ => None,
+    }
+}
+
+fn param(csi: &Csi, index: usize) -> u16 {
+    csi.params.get(index).copied().flatten().unwrap_or(0)
+}
+
+fn param_count(csi: &Csi, index: usize) -> usize {
+    usize::from(param(csi, index).max(1))
 }
 
 #[derive(Debug)]
 pub struct Cursor {
     pub position: Position,
     pub pending_wrap: bool,
-
     pub visible: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ruterm_parser::Parser;
+
+    fn feed(terminal: &mut Terminal, input: &[u8]) {
+        Parser::default().advance(input, |action| terminal.process(action));
+    }
+
+    fn row(terminal: &Terminal, index: usize) -> String {
+        let start = index * terminal.screen.cols();
+        terminal.screen.cells[start..start + terminal.screen.cols()]
+            .iter()
+            .map(|cell| cell.ch)
+            .collect()
+    }
+
+    #[test]
+    fn prints_wraps_and_scrolls() {
+        let mut terminal = Terminal::new(2, 3);
+        feed(&mut terminal, b"abcdefg");
+        assert_eq!(row(&terminal, 0), "def");
+        assert_eq!(row(&terminal, 1), "g  ");
+        assert_eq!(terminal.cursor.position, Position { row: 1, col: 1 });
+    }
+
+    #[test]
+    fn handles_cursor_movement_and_erasure() {
+        let mut terminal = Terminal::new(2, 5);
+        feed(&mut terminal, b"abcde\x1b[1;3H\x1b[0K");
+        assert_eq!(row(&terminal, 0), "ab   ");
+        feed(&mut terminal, b"Z\x1b[2;1Hq\x1b[2J");
+        assert_eq!(row(&terminal, 0), "     ");
+        assert_eq!(row(&terminal, 1), "     ");
+    }
+
+    #[test]
+    fn handles_sgr_colors_and_reset() {
+        let mut terminal = Terminal::new(1, 4);
+        feed(&mut terminal, b"\x1b[1;38;2;12;34;56;48;5;123mA\x1b[0mB");
+        let first = terminal.screen.cells[0];
+        assert_eq!(first.attrs.fg, Color::Rgb(12, 34, 56));
+        assert_eq!(first.attrs.bg, Color::Indexed(123));
+        assert!(first.attrs.flags.contains(Flags::BOLD));
+        assert_eq!(terminal.screen.cells[1].attrs, Attributes::default());
+    }
+
+    #[test]
+    fn saves_cursor_and_manages_tabs() {
+        let mut terminal = Terminal::new(2, 20);
+        feed(&mut terminal, b"\tX\x1b7\x1b[2;1H\x1b[31mY\x1b8Z");
+        assert_eq!(terminal.screen.cells[8].ch, 'X');
+        assert_eq!(terminal.screen.cells[9].ch, 'Z');
+        assert_eq!(terminal.screen.cells[20].attrs.fg, Color::Indexed(1));
+        assert_eq!(terminal.screen.cells[9].attrs.fg, Color::Default);
+        feed(&mut terminal, b"\x1b[3g\r\t");
+        assert_eq!(terminal.cursor.position.col, 19);
+    }
+
+    #[test]
+    fn supports_insert_and_delete() {
+        let mut terminal = Terminal::new(1, 5);
+        feed(&mut terminal, b"abcde\r\x1b[2C\x1b[@");
+        assert_eq!(row(&terminal, 0), "ab cd");
+        feed(&mut terminal, b"\x1b[P");
+        assert_eq!(row(&terminal, 0), "abcd ");
+    }
+
+    #[test]
+    fn reverse_index_scrolls_down_at_top() {
+        let mut terminal = Terminal::new(2, 3);
+        feed(&mut terminal, b"abc\r\nxyz\x1b[1;1H\x1bM");
+        assert_eq!(row(&terminal, 0), "   ");
+        assert_eq!(row(&terminal, 1), "abc");
+    }
+
+    #[test]
+    fn empty_screen_is_safe() {
+        let mut terminal = Terminal::new(0, 0);
+        feed(&mut terminal, b"abc\n\x1b[2J\x1bc");
+        assert!(terminal.screen.cells.is_empty());
+    }
 }

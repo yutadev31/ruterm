@@ -7,6 +7,17 @@ pub struct Attributes {
     pub underline: UnderlineStyle,
 }
 
+impl Default for Attributes {
+    fn default() -> Self {
+        Self {
+            fg: Color::Default,
+            bg: Color::Default,
+            flags: Flags::empty(),
+            underline: UnderlineStyle::None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Color {
     Default,

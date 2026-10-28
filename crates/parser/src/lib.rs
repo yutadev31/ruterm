@@ -121,10 +121,8 @@ impl Parser {
                 self.esc.push(byte);
             }
             0x30..=0x7e => {
-                if let Some(esc) = self.esc.build(byte) {
-                    return Some(Action::Esc(esc));
-                }
                 self.state = State::Ground;
+                return self.esc.build(byte).map(Action::Esc);
             }
 
             _ => {}
@@ -441,6 +439,21 @@ mod tests {
                 intermediate_len: 0,
                 final_byte: b'7',
             }),],
+        );
+    }
+
+    #[test]
+    fn returns_to_ground_after_esc() {
+        assert_eq!(
+            parse(b"\x1b7A"),
+            vec![
+                Action::Esc(Esc {
+                    intermediates: [0, 0],
+                    intermediate_len: 0,
+                    final_byte: b'7',
+                }),
+                Action::Print('A'),
+            ],
         );
     }
 
