@@ -174,3 +174,11 @@ fn alternate_cursor_saves_do_not_replace_normal_cursor_save() {
     );
     assert_eq!(terminal.cursor.position, Position { row: 0, col: 1 });
 }
+
+#[test]
+fn dcs_payload_does_not_change_screen_or_cursor() {
+    let mut terminal = Terminal::new(1, 8);
+    feed(&mut terminal, b"A\x1bP1;2qhidden\x07\x1b\\B");
+    assert_eq!(row(&terminal, 0), "AB      ");
+    assert_eq!(terminal.cursor.position, Position { row: 0, col: 2 });
+}

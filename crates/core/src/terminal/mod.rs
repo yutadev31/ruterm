@@ -1,4 +1,4 @@
-use ruterm_parser::{Action, Csi, Esc, Osc};
+use ruterm_parser::{Action, Csi, Dcs, Esc, Osc};
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
@@ -52,6 +52,7 @@ impl Terminal {
             Action::Esc(esc) => self.esc(esc),
             Action::Csi(csi) => self.csi(csi),
             Action::Osc(osc) => self.osc(osc),
+            Action::Dcs(dcs) => self.dcs(dcs),
         }
     }
 
@@ -300,6 +301,8 @@ impl Terminal {
     }
 
     fn osc(&mut self, _osc: Osc) {}
+
+    fn dcs(&mut self, _dcs: Dcs) {}
 }
 
 fn param(csi: &Csi, index: usize) -> u16 {

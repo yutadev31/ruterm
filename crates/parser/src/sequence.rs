@@ -1,4 +1,4 @@
-use crate::{Csi, Esc, Osc};
+use crate::{Csi, Dcs, Esc, Osc};
 
 #[derive(Debug, Default)]
 pub(crate) struct EscParser {
@@ -74,6 +74,43 @@ impl CsiParser {
             params: self.params.clone(),
             intermediates: self.intermediates.clone(),
             final_byte,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct DcsParser {
+    pub(crate) header: CsiParser,
+    final_byte: u8,
+    data: Vec<u8>,
+}
+
+impl DcsParser {
+    pub(crate) fn reset(&mut self) {
+        self.header.reset();
+        self.final_byte = 0;
+        self.data.clear();
+    }
+
+    pub(crate) fn set_final_byte(&mut self, byte: u8, has_param: bool) {
+        if has_param {
+            self.header.finish_param();
+        }
+        self.final_byte = byte;
+    }
+
+    pub(crate) fn push(&mut self, byte: u8) {
+        self.data.push(byte);
+    }
+
+    pub(crate) fn build(&self) -> Dcs {
+        let header = self.header.build(self.final_byte);
+        Dcs {
+            private: header.private,
+            params: header.params,
+            intermediates: header.intermediates,
+            final_byte: header.final_byte,
+            data: self.data.clone(),
         }
     }
 }

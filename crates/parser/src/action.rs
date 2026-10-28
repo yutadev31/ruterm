@@ -5,6 +5,7 @@ pub enum Action {
     Esc(Esc),
     Csi(Csi),
     Osc(Osc),
+    Dcs(Dcs),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,5 +26,14 @@ pub struct Csi {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Osc {
     pub command: u16,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dcs {
+    pub private: Option<u8>,
+    pub params: Vec<Option<u16>>,
+    pub intermediates: Vec<u8>,
+    pub final_byte: u8,
     pub data: Vec<u8>,
 }

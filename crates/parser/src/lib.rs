@@ -2,8 +2,8 @@ mod action;
 mod sequence;
 mod utf8;
 
-pub use action::{Action, Csi, Esc, Osc};
-use sequence::{CsiParser, EscParser, OscParser};
+pub use action::{Action, Csi, Dcs, Esc, Osc};
+use sequence::{CsiParser, DcsParser, EscParser, OscParser};
 use utf8::Utf8Decoder;
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -19,6 +19,14 @@ enum State {
 
     OscString,
     OscEscape,
+
+    DcsEntry,
+    DcsParam,
+    DcsIntermediate,
+    DcsIgnore,
+    DcsString,
+    DcsEscape,
+    DcsIgnoreEscape,
 }
 
 #[derive(Debug, Default)]
@@ -28,6 +36,7 @@ pub struct Parser {
     esc: EscParser,
     csi: CsiParser,
     osc: OscParser,
+    dcs: DcsParser,
 }
 
 impl Parser {
@@ -51,6 +60,12 @@ impl Parser {
             State::CsiIgnore => self.advance_csi_ignore(byte),
             State::OscString => self.advance_osc_string(byte),
             State::OscEscape => self.advance_osc_escape(byte),
+            State::DcsEntry | State::DcsParam => self.advance_dcs_header(byte),
+            State::DcsIntermediate => self.advance_dcs_intermediate(byte),
+            State::DcsIgnore => self.advance_dcs_ignore(byte),
+            State::DcsString => self.advance_dcs_string(byte),
+            State::DcsEscape => self.advance_dcs_escape(byte),
+            State::DcsIgnoreEscape => self.advance_dcs_ignore_escape(byte),
         }
     }
 
@@ -87,6 +102,12 @@ impl Parser {
             b']' => {
                 self.osc.reset();
                 self.state = State::OscString;
+            }
+
+            // DCS
+            b'P' => {
+                self.dcs.reset();
+                self.state = State::DcsEntry;
             }
 
             // ESC
@@ -207,6 +228,109 @@ impl Parser {
         self.state = State::Ground;
 
         self.osc.build().map(Action::Osc)
+    }
+
+    fn advance_dcs_header(&mut self, byte: u8) -> Option<Action> {
+        match byte {
+            0x18 | 0x1a => self.state = State::Ground,
+            0x1b => {
+                self.esc.reset();
+                self.state = State::Escape;
+            }
+            b'0'..=b'9' => {
+                self.dcs.header.push_digit(byte);
+                self.state = State::DcsParam;
+            }
+            b';' | b':' => {
+                self.dcs.header.finish_param();
+                self.state = State::DcsParam;
+            }
+            b'<' | b'=' | b'>' | b'?' => {
+                if matches!(self.state, State::DcsEntry) {
+                    self.dcs.header.set_private(byte);
+                    self.state = State::DcsParam;
+                } else {
+                    self.state = State::DcsIgnore;
+                }
+            }
+            0x20..=0x2f => {
+                if matches!(self.state, State::DcsParam) {
+                    self.dcs.header.finish_param();
+                }
+                self.dcs.header.push_intermediate(byte);
+                self.state = State::DcsIntermediate;
+            }
+            0x40..=0x7e => {
+                self.dcs
+                    .set_final_byte(byte, matches!(self.state, State::DcsParam));
+                self.state = State::DcsString;
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn advance_dcs_intermediate(&mut self, byte: u8) -> Option<Action> {
+        match byte {
+            0x18 | 0x1a => self.state = State::Ground,
+            0x1b => {
+                self.esc.reset();
+                self.state = State::Escape;
+            }
+            0x30..=0x3f => self.state = State::DcsIgnore,
+            0x20..=0x2f => self.dcs.header.push_intermediate(byte),
+            0x40..=0x7e => {
+                self.dcs.set_final_byte(byte, false);
+                self.state = State::DcsString;
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn advance_dcs_ignore(&mut self, byte: u8) -> Option<Action> {
+        match byte {
+            0x18 | 0x1a => self.state = State::Ground,
+            0x1b => self.state = State::DcsIgnoreEscape,
+            _ => {}
+        }
+        None
+    }
+
+    fn advance_dcs_ignore_escape(&mut self, byte: u8) -> Option<Action> {
+        self.state = if byte == b'\\' || matches!(byte, 0x18 | 0x1a) {
+            State::Ground
+        } else if byte == 0x1b {
+            State::DcsIgnoreEscape
+        } else {
+            State::DcsIgnore
+        };
+        None
+    }
+
+    fn advance_dcs_string(&mut self, byte: u8) -> Option<Action> {
+        match byte {
+            0x18 | 0x1a => self.state = State::Ground,
+            0x1b => self.state = State::DcsEscape,
+            _ => self.dcs.push(byte),
+        }
+        None
+    }
+
+    fn advance_dcs_escape(&mut self, byte: u8) -> Option<Action> {
+        match byte {
+            b'\\' => {
+                self.state = State::Ground;
+                return Some(Action::Dcs(self.dcs.build()));
+            }
+            0x18 | 0x1a => self.state = State::Ground,
+            _ => {
+                self.dcs.push(0x1b);
+                self.dcs.push(byte);
+                self.state = State::DcsString;
+            }
+        }
+        None
     }
 }
 
@@ -394,5 +518,50 @@ mod tests {
     #[test]
     fn ignores_invalid_csi_and_resumes_printing() {
         assert_eq!(parse(b"\x1b[1?25hA"), vec![Action::Print('A')]);
+    }
+
+    #[test]
+    fn parses_dcs_header_and_binary_payload() {
+        assert_eq!(
+            parse(b"\x1bP?1;23 $qabc\x07\xff\x1b\\Z"),
+            vec![
+                Action::Dcs(Dcs {
+                    private: Some(b'?'),
+                    params: vec![Some(1), Some(23)],
+                    intermediates: b" $".to_vec(),
+                    final_byte: b'q',
+                    data: b"abc\x07\xff".to_vec(),
+                }),
+                Action::Print('Z'),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_dcs_across_calls_and_keeps_non_terminating_escape() {
+        let mut parser = Parser::default();
+        let mut actions = Vec::new();
+        for chunk in [b"\x1bP1;".as_slice(), b"2qhello\x1bX", b"!\x1b", b"\\A"] {
+            parser.advance(chunk, |action| actions.push(action));
+        }
+        assert_eq!(
+            actions,
+            vec![
+                Action::Dcs(Dcs {
+                    private: None,
+                    params: vec![Some(1), Some(2)],
+                    intermediates: vec![],
+                    final_byte: b'q',
+                    data: b"hello\x1bX!".to_vec(),
+                }),
+                Action::Print('A'),
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_invalid_dcs_until_st_and_recovers_after_cancel() {
+        assert_eq!(parse(b"\x1bP1?qa\x1b\\B"), vec![Action::Print('B')]);
+        assert_eq!(parse(b"\x1bPqabc\x18C"), vec![Action::Print('C')]);
     }
 }
