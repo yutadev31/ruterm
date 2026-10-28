@@ -1,7 +1,7 @@
 use super::Terminal;
 use crate::{attributes::Attributes, common::Position};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Cursor {
     pub position: Position,
     pub pending_wrap: bool,
@@ -102,7 +102,11 @@ impl Terminal {
     }
 
     pub(super) fn reset(&mut self) {
+        if let Some(normal_screen) = self.normal_screen.take() {
+            self.screen = normal_screen;
+        }
         self.screen.clear();
+        self.screen.scrollback.clear();
         self.cursor = Cursor {
             position: Position::default(),
             pending_wrap: false,
@@ -110,6 +114,8 @@ impl Terminal {
         };
         self.attrs = Attributes::default();
         self.saved_cursor = None;
+        self.normal_saved_cursor = None;
+        self.alternate_saved_cursor = None;
         self.tab_stops = (0..self.screen.cols())
             .map(|col| col != 0 && col % 8 == 0)
             .collect();

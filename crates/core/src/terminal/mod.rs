@@ -21,6 +21,9 @@ pub struct Terminal {
     pub cursor: Cursor,
     pub attrs: Attributes,
     saved_cursor: Option<(Position, Attributes)>,
+    normal_saved_cursor: Option<(Position, Attributes)>,
+    normal_screen: Option<Screen>,
+    alternate_saved_cursor: Option<(Cursor, Attributes)>,
     tab_stops: Vec<bool>,
 }
 
@@ -35,6 +38,9 @@ impl Terminal {
             },
             attrs: Attributes::default(),
             saved_cursor: None,
+            normal_saved_cursor: None,
+            normal_screen: None,
+            alternate_saved_cursor: None,
             tab_stops: (0..cols).map(|col| col != 0 && col % 8 == 0).collect(),
         }
     }
@@ -52,6 +58,9 @@ impl Terminal {
     pub fn resize(&mut self, rows: usize, cols: usize) {
         let old_cols = self.tab_stops.len();
         self.screen.resize(rows, cols);
+        if let Some(normal_screen) = &mut self.normal_screen {
+            normal_screen.resize(rows, cols);
+        }
         self.cursor.position.row = self.cursor.position.row.min(rows.saturating_sub(1));
         self.cursor.position.col = self.cursor.position.col.min(cols.saturating_sub(1));
         self.cursor.pending_wrap = false;
@@ -64,6 +73,41 @@ impl Terminal {
         if let Some((position, _)) = &mut self.saved_cursor {
             position.row = position.row.min(rows.saturating_sub(1));
             position.col = position.col.min(cols.saturating_sub(1));
+        }
+        if let Some((position, _)) = &mut self.normal_saved_cursor {
+            position.row = position.row.min(rows.saturating_sub(1));
+            position.col = position.col.min(cols.saturating_sub(1));
+        }
+        if let Some((cursor, _)) = &mut self.alternate_saved_cursor {
+            cursor.position.row = cursor.position.row.min(rows.saturating_sub(1));
+            cursor.position.col = cursor.position.col.min(cols.saturating_sub(1));
+        }
+    }
+
+    pub fn is_alternate_screen(&self) -> bool {
+        self.normal_screen.is_some()
+    }
+
+    fn set_alternate_screen(&mut self, enabled: bool, save_cursor: bool) {
+        if enabled {
+            if self.normal_screen.is_some() {
+                return;
+            }
+            if save_cursor {
+                self.alternate_saved_cursor = Some((self.cursor, self.attrs));
+                self.cursor.position = Position::default();
+                self.cursor.pending_wrap = false;
+            }
+            self.normal_saved_cursor = self.saved_cursor.take();
+            let alternate = Screen::alternate(self.screen.rows(), self.screen.cols());
+            self.normal_screen = Some(std::mem::replace(&mut self.screen, alternate));
+        } else if let Some(normal_screen) = self.normal_screen.take() {
+            self.screen = normal_screen;
+            self.saved_cursor = self.normal_saved_cursor.take();
+            if let Some((cursor, attrs)) = self.alternate_saved_cursor.take() {
+                self.cursor = cursor;
+                self.attrs = attrs;
+            }
         }
     }
 
@@ -163,8 +207,23 @@ impl Terminal {
             return;
         }
         if csi.private == Some(b'?') {
-            if matches!(csi.final_byte, b'h' | b'l') && csi.params.contains(&Some(25)) {
-                self.cursor.visible = csi.final_byte == b'h';
+            if matches!(csi.final_byte, b'h' | b'l') {
+                let enabled = csi.final_byte == b'h';
+                for mode in csi.params.iter().flatten() {
+                    match mode {
+                        25 => self.cursor.visible = enabled,
+                        47 | 1047 => self.set_alternate_screen(enabled, false),
+                        1048 => {
+                            if enabled {
+                                self.save_cursor();
+                            } else {
+                                self.restore_cursor();
+                            }
+                        }
+                        1049 => self.set_alternate_screen(enabled, true),
+                        _ => {}
+                    }
+                }
             }
             return;
         }

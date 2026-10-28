@@ -941,8 +941,13 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Output => {
                 let bytes = self.output.take();
                 let old_history = self.terminal.screen.scrollback.len();
+                let was_alternate = self.terminal.is_alternate_screen();
                 self.parser
                     .advance(&bytes, |action| self.terminal.process(action));
+                if was_alternate != self.terminal.is_alternate_screen() {
+                    self.scroll_offset = 0;
+                    self.selection = None;
+                }
                 if self.scroll_offset > 0 {
                     self.scroll_offset = self
                         .scroll_offset

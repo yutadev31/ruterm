@@ -117,3 +117,60 @@ fn scrollback_keeps_scrolled_lines() {
     assert_eq!(view[0].ch, 'a');
     assert_eq!(view[2].ch, 'b');
 }
+
+#[test]
+fn alternate_screen_restores_normal_content_history_and_cursor() {
+    let mut terminal = Terminal::new(2, 3);
+    feed(&mut terminal, b"abc\r\ndef\r\ng\x1b[31m");
+    let normal_cursor = terminal.cursor.position;
+    let normal_history = terminal.screen.scrollback.clone();
+
+    feed(&mut terminal, b"\x1b[?1049h");
+    assert!(terminal.is_alternate_screen());
+    assert_eq!(row(&terminal, 0), "   ");
+    assert_eq!(terminal.cursor.position, Position::default());
+    feed(&mut terminal, b"one\r\ntwo\r\nend\x1b[32m");
+    assert!(terminal.screen.scrollback.is_empty());
+
+    feed(&mut terminal, b"\x1b[?1049l");
+    assert!(!terminal.is_alternate_screen());
+    assert_eq!(row(&terminal, 0), "def");
+    assert_eq!(row(&terminal, 1), "g  ");
+    assert_eq!(terminal.screen.scrollback, normal_history);
+    assert_eq!(terminal.cursor.position, normal_cursor);
+    assert_eq!(terminal.attrs.fg, Color::Indexed(1));
+}
+
+#[test]
+fn alternate_screen_modes_are_idempotent_and_resize_both_buffers() {
+    let mut terminal = Terminal::new(1, 3);
+    feed(&mut terminal, b"abc\x1b[?47hX\x1b[?47h");
+    assert_eq!(row(&terminal, 0), "X  ");
+    terminal.resize(2, 4);
+    feed(&mut terminal, b"\x1b[?1047l");
+    assert_eq!(row(&terminal, 0), "abc ");
+    assert_eq!(terminal.screen.rows(), 2);
+    feed(&mut terminal, b"\x1b[?47l");
+    assert_eq!(row(&terminal, 0), "abc ");
+}
+
+#[test]
+fn private_cursor_save_and_reset_leave_no_alternate_screen() {
+    let mut terminal = Terminal::new(2, 3);
+    feed(&mut terminal, b"\x1b[2;2H\x1b[?1048h\x1b[1;1H\x1b[?1048l");
+    assert_eq!(terminal.cursor.position, Position { row: 1, col: 1 });
+    feed(&mut terminal, b"abc\x1b[?1049hxyz\x1bc");
+    assert!(!terminal.is_alternate_screen());
+    assert_eq!(row(&terminal, 0), "   ");
+    assert!(terminal.screen.scrollback.is_empty());
+}
+
+#[test]
+fn alternate_cursor_saves_do_not_replace_normal_cursor_save() {
+    let mut terminal = Terminal::new(2, 4);
+    feed(
+        &mut terminal,
+        b"\x1b[1;2H\x1b7\x1b[?1049h\x1b[2;3H\x1b7\x1b[?1049l\x1b[2;4H\x1b8",
+    );
+    assert_eq!(terminal.cursor.position, Position { row: 0, col: 1 });
+}

@@ -7,6 +7,7 @@ pub struct Screen {
     pub height: usize,
     pub cells: Vec<Cell>,
     pub scrollback: VecDeque<Vec<Cell>>,
+    save_scrollback: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,7 +36,14 @@ impl Screen {
             height: rows,
             cells: vec![Cell::default(); rows.saturating_mul(cols)],
             scrollback: VecDeque::new(),
+            save_scrollback: true,
         }
+    }
+
+    pub(crate) fn alternate(rows: usize, cols: usize) -> Self {
+        let mut screen = Self::new(rows, cols);
+        screen.save_scrollback = false;
+        screen
     }
 
     pub fn set_cell(&mut self, row: usize, col: usize, cell: Cell) {
@@ -80,9 +88,11 @@ impl Screen {
         }
         let lines = amount.min(self.height);
         let mut removed = self.cells.drain(..lines * self.width);
-        for _ in 0..lines {
-            self.scrollback
-                .push_back(removed.by_ref().take(self.width).collect());
+        if self.save_scrollback {
+            for _ in 0..lines {
+                self.scrollback
+                    .push_back(removed.by_ref().take(self.width).collect());
+            }
         }
         drop(removed);
         while self.scrollback.len() > 1000 {
