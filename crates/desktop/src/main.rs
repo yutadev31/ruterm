@@ -1055,9 +1055,8 @@ impl TextRenderer {
     }
 
     fn shape_glyph(&mut self, key: &TextKey) -> CellGlyph {
-        let width = self.cell.width * key.span;
+        let cell_width = self.cell.width * key.span;
         let height = self.cell.height;
-        let mut rgba = vec![0; width * height * 4];
         let mut buffer = Buffer::new_empty(Metrics::new(self.font_size, height as f32));
         buffer.set_wrap(Wrap::None);
         let attrs = Attrs::new()
@@ -1079,32 +1078,43 @@ impl TextRenderer {
             .flat_map(|run| run.glyphs.iter())
             .map(|glyph| glyph.x + glyph.w)
             .fold(0.0_f32, f32::max);
-        let x_offset = ((width as f32 - advance) / 2.0).round() as i32;
+        let x_offset = ((cell_width as f32 - advance).max(0.0) / 2.0).round() as i32;
+        let mut samples = Vec::new();
         buffer.draw(
             &mut self.font_system,
             &mut self.swash_cache,
             TextColor::rgb(255, 255, 255),
             |x, y, _w, _h, color| {
                 let x = x + x_offset;
-                if x < 0 || x >= width as i32 || y < 0 || y >= height as i32 {
+                let rgba = color.as_rgba();
+                if x < 0 || y < 0 || y >= height as i32 || rgba[3] == 0 {
                     return;
                 }
-                let offset = (y as usize * width + x as usize) * 4;
-                let [r, g, b, a] = color.as_rgba();
-                let old_a = rgba[offset + 3] as u16;
-                let new_a = a as u16 + old_a * (255 - a as u16) / 255;
-                if new_a == 0 {
-                    return;
-                }
-                for (channel, source) in [r, g, b].into_iter().enumerate() {
-                    let old = rgba[offset + channel] as u16;
-                    rgba[offset + channel] = ((source as u16 * a as u16
-                        + old * old_a * (255 - a as u16) / 255)
-                        / new_a) as u8;
-                }
-                rgba[offset + 3] = new_a as u8;
+                samples.push((x as usize, y as usize, rgba));
             },
         );
+        let width = samples
+            .iter()
+            .map(|(x, _, _)| x + 1)
+            .max()
+            .unwrap_or(0)
+            .max(cell_width);
+        let mut rgba = vec![0; width * height * 4];
+        for (x, y, [r, g, b, a]) in samples {
+            let offset = (y * width + x) * 4;
+            let old_a = rgba[offset + 3] as u16;
+            let new_a = a as u16 + old_a * (255 - a as u16) / 255;
+            if new_a == 0 {
+                continue;
+            }
+            for (channel, source) in [r, g, b].into_iter().enumerate() {
+                let old = rgba[offset + channel] as u16;
+                rgba[offset + channel] = ((source as u16 * a as u16
+                    + old * old_a * (255 - a as u16) / 255)
+                    / new_a) as u8;
+            }
+            rgba[offset + 3] = new_a as u8;
+        }
         CellGlyph {
             width,
             height,
@@ -1220,7 +1230,7 @@ fn rasterize(
                 text.push_str(&cell.combining);
                 let glyph = text_renderer.glyph(&text, span, cell.attrs.flags);
                 for y in 0..glyph.height {
-                    for x in 0..glyph.width {
+                    for x in 0..glyph.width.min(width - col * cell_size.width) {
                         let source = (y * glyph.width + x) * 4;
                         let alpha = glyph.rgba[source + 3] as u16;
                         if alpha == 0 {
@@ -1423,12 +1433,54 @@ mod tests {
         let mut renderer = TextRenderer::new(&FontSettings::default(), cell);
         for (text, span) in [("A", 1), ("日", 2), ("e\u{301}", 1)] {
             let glyph = renderer.glyph(text, span, Flags::empty());
-            assert_eq!(glyph.width, cell.width * span);
+            assert!(glyph.width >= cell.width * span);
             assert_eq!(glyph.height, cell.height);
             assert!(
                 glyph.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0),
                 "{text}"
             );
+        }
+    }
+
+    #[test]
+    fn rasterizes_overhanging_glyph_across_cell_boundary() {
+        let cell = CellSize {
+            width: 10,
+            height: 20,
+        };
+        let mut renderer = TextRenderer::new(&FontSettings::default(), cell);
+        let mut rgba = vec![0; 20 * cell.height * 4];
+        rgba[(10 * 20 + 15) * 4..(10 * 20 + 15) * 4 + 4].copy_from_slice(&[255, 255, 255, 255]);
+        renderer.glyphs.insert(
+            TextKey {
+                text: "\u{f013}".into(),
+                span: 1,
+                bold: false,
+                italic: false,
+            },
+            CellGlyph {
+                width: 20,
+                height: cell.height,
+                rgba,
+            },
+        );
+        for cols in [1, 2] {
+            let mut terminal = Terminal::new(1, cols);
+            terminal.cursor.visible = false;
+            terminal.screen.set_cell(
+                0,
+                0,
+                Cell {
+                    ch: '\u{f013}',
+                    ..Default::default()
+                },
+            );
+            let mut pixels = Vec::new();
+            rasterize(&terminal, cell, &mut renderer, "", 0, None, &mut pixels);
+            if cols == 2 {
+                let offset = (10 * 20 + 15) * 4;
+                assert_eq!(&pixels[offset..offset + 3], &[220, 220, 220]);
+            }
         }
     }
 
