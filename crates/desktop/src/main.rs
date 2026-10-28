@@ -348,6 +348,17 @@ impl App {
         }
     }
 
+    fn close(&mut self, event_loop: &ActiveEventLoop) {
+        self.input.take();
+        if let Some(pty) = &mut self.pty {
+            let _ = pty.terminate();
+        }
+        // EGL must terminate while winit's Wayland connection still exists.
+        self.gpu.take();
+        self.window.take();
+        event_loop.exit();
+    }
+
     fn start_shell(&mut self) {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let rows = self.terminal.screen.rows();
@@ -647,14 +658,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
         match event {
             WindowEvent::CloseRequested => {
-                self.input.take();
-                if let Some(pty) = &mut self.pty {
-                    let _ = pty.terminate();
-                }
-                // EGL must terminate while winit's Wayland connection still exists.
-                self.gpu.take();
-                self.window.take();
-                event_loop.exit();
+                self.close(event_loop);
             }
             WindowEvent::Resized(size) => {
                 self.drawable = size.width > 0 && size.height > 0;
@@ -761,7 +765,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Output(bytes, ack) => {
                 let old_history = self.terminal.screen.scrollback.len();
@@ -785,19 +789,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::End(error) if !self.ended => {
                 self.ended = true;
-                let status = self
-                    .pty
-                    .as_mut()
-                    .and_then(|pty| pty.try_wait().ok().flatten());
-                let text = if error.is_empty() {
-                    format!(
-                        "Shell exited: {}",
-                        status.map_or_else(|| "unknown status".into(), |s| s.to_string())
-                    )
+                if error.is_empty() {
+                    self.close(event_loop);
                 } else {
-                    error
-                };
-                self.message(&text);
+                    self.message(&error);
+                }
             }
             UserEvent::WriteError(error) => self.message(&error),
             _ => {}
