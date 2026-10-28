@@ -6,3 +6,5 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
+bitflags.workspace = true
+ruterm-parser.workspace = true

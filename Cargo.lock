@@ -41,6 +41,10 @@ dependencies = [
 [[package]]
 name = "ruterm-core"
 version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "ruterm-parser",
+]
 
 [[package]]
 name = "ruterm-parser"

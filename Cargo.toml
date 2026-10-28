@@ -8,3 +8,7 @@ repository = "https://github.com/yutadev31/ruterm.git"
 license = "MIT"
 
 [workspace.dependencies]
+bitflags = "2.13.2"
+nix = "0.31.3"
+ruterm-parser.path = "crates/parser"
+ruterm-pty.path = "crates/pty"
