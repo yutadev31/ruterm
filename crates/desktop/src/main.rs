@@ -1352,8 +1352,17 @@ fn rasterize(
                 let mut text = cell.ch.to_string();
                 text.push_str(&cell.combining);
                 let glyph = text_renderer.glyph(&text, span, cell.attrs.flags);
+                // Box drawing glyphs must not paint into the following cell: a
+                // font's antialiased right edge can otherwise be blended with
+                // the next glyph and make a join look heavier.
+                let glyph_width =
+                    if cell.combining.is_empty() && ('\u{2500}'..='\u{257f}').contains(&cell.ch) {
+                        glyph.width.min(span * cell_size.width)
+                    } else {
+                        glyph.width
+                    };
                 for y in 0..glyph.height {
-                    for x in 0..glyph.width.min(width - col * cell_size.width) {
+                    for x in 0..glyph_width.min(width - col * cell_size.width) {
                         let source = (y * glyph.width + x) * 4;
                         let alpha = glyph.rgba[source + 3] as u16;
                         if alpha == 0 {
@@ -1616,6 +1625,44 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn box_drawing_glyphs_do_not_overlap_adjacent_cells() {
+        let cell = CellSize {
+            width: 10,
+            height: 20,
+        };
+        let mut renderer = TextRenderer::new(&FontSettings::default(), cell);
+        let mut rgba = vec![0; 20 * cell.height * 4];
+        rgba[(10 * 20 + 15) * 4..(10 * 20 + 15) * 4 + 4].copy_from_slice(&[255, 255, 255, 255]);
+        renderer.glyphs.insert(
+            TextKey {
+                text: "─".into(),
+                span: 1,
+                bold: false,
+                italic: false,
+            },
+            CellGlyph {
+                width: 20,
+                height: cell.height,
+                rgba,
+            },
+        );
+        let mut terminal = Terminal::new(1, 2);
+        terminal.cursor.visible = false;
+        terminal.screen.set_cell(
+            0,
+            0,
+            Cell {
+                ch: '─',
+                ..Default::default()
+            },
+        );
+        let mut pixels = Vec::new();
+        rasterize(&terminal, cell, &mut renderer, "", 0, None, &mut pixels);
+        let offset = (10 * 20 + 15) * 4;
+        assert_eq!(&pixels[offset..offset + 3], &[20, 22, 27]);
     }
 
     #[test]
