@@ -36,6 +36,7 @@ impl Terminal {
                     .find(|&i| self.tab_stops[i])
                     .unwrap_or(0)
             };
+
             self.cursor.position.col = stop;
         }
     }
@@ -81,6 +82,7 @@ impl Terminal {
                 row: position.row.min(self.screen.rows().saturating_sub(1)),
                 col: position.col.min(self.screen.cols().saturating_sub(1)),
             };
+
             self.attrs = attrs;
         }
     }
@@ -107,6 +109,7 @@ impl Terminal {
         if let Some(normal_screen) = self.normal_screen.take() {
             self.screen = normal_screen;
         }
+
         self.screen.clear();
         self.screen.scrollback.clear();
         self.cursor = Cursor {

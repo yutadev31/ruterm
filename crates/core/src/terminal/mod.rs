@@ -10,6 +10,7 @@ use crate::{
 mod cursor;
 mod editing;
 mod rendition;
+
 #[cfg(test)]
 mod tests;
 
@@ -105,29 +106,36 @@ impl Terminal {
 
     pub fn resize(&mut self, rows: usize, cols: usize) {
         let old_cols = self.tab_stops.len();
+
         self.screen.resize(rows, cols);
         self.scroll_top = 0;
         self.scroll_bottom = rows;
+
         if let Some(normal_screen) = &mut self.normal_screen {
             normal_screen.resize(rows, cols);
         }
+
         self.cursor.position.row = self.cursor.position.row.min(rows.saturating_sub(1));
         self.cursor.position.col = self.cursor.position.col.min(cols.saturating_sub(1));
         self.cursor.pending_wrap = false;
         self.tab_stops.resize(cols, false);
+
         for col in old_cols..cols {
             if col != 0 && col % 8 == 0 {
                 self.tab_stops[col] = true;
             }
         }
+
         if let Some((position, _)) = &mut self.saved_cursor {
             position.row = position.row.min(rows.saturating_sub(1));
             position.col = position.col.min(cols.saturating_sub(1));
         }
+
         if let Some((position, _)) = &mut self.normal_saved_cursor {
             position.row = position.row.min(rows.saturating_sub(1));
             position.col = position.col.min(cols.saturating_sub(1));
         }
+
         if let Some((cursor, _)) = &mut self.alternate_saved_cursor {
             cursor.position.row = cursor.position.row.min(rows.saturating_sub(1));
             cursor.position.col = cursor.position.col.min(cols.saturating_sub(1));
@@ -147,11 +155,13 @@ impl Terminal {
             if self.normal_screen.is_some() {
                 return;
             }
+
             if save_cursor {
                 self.alternate_saved_cursor = Some((self.cursor, self.attrs));
                 self.cursor.position = Position::default();
                 self.cursor.pending_wrap = false;
             }
+
             self.normal_saved_cursor = self.saved_cursor.take();
             let alternate = Screen::alternate(self.screen.rows(), self.screen.cols());
             self.normal_screen = Some(std::mem::replace(&mut self.screen, alternate));
@@ -169,11 +179,13 @@ impl Terminal {
         if self.screen.rows() == 0 || self.screen.cols() == 0 {
             return;
         }
+
         let ch = if self.charsets[self.active_charset] {
             dec_graphics(ch)
         } else {
             ch
         };
+
         let width = UnicodeWidthChar::width(ch)
             .unwrap_or(0)
             .min(self.screen.cols());
@@ -183,21 +195,26 @@ impl Terminal {
             } else {
                 self.cursor.position.col.saturating_sub(1)
             };
+
             if col > 0
                 && self.screen.cells[self.cursor.position.row * self.screen.cols() + col]
                     .wide_continuation
             {
                 col -= 1;
             }
+
             let index = self.cursor.position.row * self.screen.cols() + col;
+
             if let Some(cell) = self.screen.cells.get_mut(index) {
                 cell.combining.push(ch);
             }
             return;
         }
+
         if self.cursor.pending_wrap && self.auto_wrap {
             self.wrap_line();
         }
+
         if width == 2 && self.cursor.position.col + 1 >= self.screen.cols() {
             if self.auto_wrap {
                 self.wrap_line();
@@ -205,12 +222,14 @@ impl Terminal {
                 return;
             }
         }
+
         let row = self.cursor.position.row.min(self.screen.rows() - 1);
         let col = self.cursor.position.col.min(self.screen.cols() - 1);
         self.cursor.position = Position { row, col };
         if self.insert_mode {
             self.insert_chars(width);
         }
+
         self.screen.set_cell(
             row,
             col,
@@ -233,6 +252,7 @@ impl Terminal {
                 },
             );
         }
+
         if col + width >= self.screen.cols() {
             self.cursor.pending_wrap = self.auto_wrap;
         } else {
@@ -250,6 +270,7 @@ impl Terminal {
             b'\x0f' => self.active_charset = 0,
             _ => return,
         }
+
         self.cursor.pending_wrap = false;
     }
 
@@ -258,13 +279,16 @@ impl Terminal {
             self.charsets[0] = esc.final_byte == b'0';
             return;
         }
+
         if esc.intermediate_len == 1 && esc.intermediates[0] == b')' {
             self.charsets[1] = esc.final_byte == b'0';
             return;
         }
+
         if esc.intermediate_len != 0 {
             return;
         }
+
         match esc.final_byte {
             b'D' => self.index(),
             b'E' => self.next_line(),
@@ -277,6 +301,7 @@ impl Terminal {
             b'>' => self.application_keypad = false,
             _ => return,
         }
+
         self.cursor.pending_wrap = false;
     }
 
@@ -291,6 +316,7 @@ impl Terminal {
             }
             return;
         }
+
         if csi.private == Some(b'?') {
             if matches!(csi.final_byte, b'h' | b'l') {
                 let enabled = csi.final_byte == b'h';
@@ -348,12 +374,14 @@ impl Terminal {
             }
             return;
         }
+
         if csi.private.is_some() {
             if csi.private == Some(b'>') && csi.final_byte == b'c' {
                 self.responses.push(b"\x1b[>0;0;0c".to_vec());
             }
             return;
         }
+
         let n = param_count(&csi, 0);
         let rows = self.screen.rows();
         let cols = self.screen.cols();
@@ -362,7 +390,9 @@ impl Terminal {
         } else {
             (0, rows)
         };
+
         let lower = bottom.saturating_sub(1);
+
         match csi.final_byte {
             b'A' => self.cursor.position.row = self.cursor.position.row.saturating_sub(n).max(top),
             b'B' | b'e' => {
@@ -430,6 +460,7 @@ impl Terminal {
                 } else {
                     usize::from(param(&csi, 1)).min(rows)
                 };
+
                 if new_top < new_bottom && new_bottom <= rows {
                     self.scroll_top = new_top;
                     self.scroll_bottom = new_bottom;
@@ -457,6 +488,7 @@ impl Terminal {
             b'u' => self.restore_cursor(),
             _ => return,
         }
+
         if !matches!(csi.final_byte, b'm' | b'g') {
             self.cursor.pending_wrap = false;
         }

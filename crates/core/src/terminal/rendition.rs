@@ -6,10 +6,12 @@ impl Terminal {
     pub(super) fn sgr(&mut self, params: &[CsiParam]) {
         let mut values = Vec::new();
         let mut separators = Vec::new();
+
         for (index, param) in params.iter().enumerate() {
             if index > 0 {
                 separators.push(b';');
             }
+
             for (subindex, value) in param.subparams.iter().copied().enumerate() {
                 if subindex > 0 {
                     separators.push(b':');
@@ -17,11 +19,13 @@ impl Terminal {
                 values.push(value);
             }
         }
+
         self.sgr_flat(&values, &separators);
     }
 
     fn sgr_flat(&mut self, params: &[Option<u16>], separators: &[u8]) {
         let mut i = 0;
+
         while i < params.len().max(1) {
             let code = params.get(i).copied().flatten().unwrap_or(0);
             let colon_end = (i + 1..params.len())
@@ -63,6 +67,7 @@ impl Terminal {
                             }
                             _ => None,
                         };
+
                         if let Some(color) = color {
                             match code {
                                 38 => self.attrs.fg = color,
@@ -73,9 +78,11 @@ impl Terminal {
                     }
                     _ => {}
                 }
+
                 i = colon_end;
                 continue;
             }
+
             match code {
                 0 => self.attrs = Attributes::default(),
                 1 => self.attrs.flags.insert(Flags::BOLD),
@@ -112,15 +119,18 @@ impl Terminal {
                         } else {
                             self.attrs.underline_color = color;
                         }
+
                         i += consumed;
                     }
                 }
                 _ => {}
             }
+
             i += 1;
         }
     }
 }
+
 fn parse_extended_color(values: &[Option<u16>]) -> Option<(Color, usize)> {
     match values {
         [Some(5), index, ..] if index.unwrap_or(0) <= 255 => {

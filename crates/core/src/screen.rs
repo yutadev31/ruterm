@@ -52,13 +52,16 @@ impl Screen {
 
     pub fn resize(&mut self, rows: usize, cols: usize) {
         let mut cells = vec![Cell::default(); rows.saturating_mul(cols)];
+
         for row in 0..rows.min(self.height) {
             for col in 0..cols.min(self.width) {
                 cells[row * cols + col] = self.cells[row * self.width + col].clone();
             }
+
             if cols > 0 && cells[row * cols + cols - 1].wide_continuation {
                 cells[row * cols + cols - 1] = Cell::default();
             }
+
             if cols > 0
                 && cols < self.width
                 && self.cells[row * self.width + cols].wide_continuation
@@ -66,9 +69,11 @@ impl Screen {
                 cells[row * cols + cols - 1] = Cell::default();
             }
         }
+
         self.width = cols;
         self.height = rows;
         self.cells = cells;
+
         for line in &mut self.scrollback {
             line.resize(cols, Cell::default());
         }
@@ -90,12 +95,15 @@ impl Screen {
         if self.width == 0 || self.height == 0 {
             return;
         }
+
         if top >= bottom || bottom > self.height {
             return;
         }
+
         let lines = amount.min(bottom - top);
         let start = top * self.width;
         let end = bottom * self.width;
+
         if top == 0 && bottom == self.height && self.save_scrollback {
             let mut removed = self.cells[start..start + lines * self.width]
                 .iter()
@@ -105,9 +113,11 @@ impl Screen {
                     .push_back(removed.by_ref().take(self.width).collect());
             }
         }
+
         while self.scrollback.len() > 1000 {
             self.scrollback.pop_front();
         }
+
         self.cells[start..end].rotate_left(lines * self.width);
         self.cells[end - lines * self.width..end].fill(Cell::default());
     }
@@ -120,12 +130,15 @@ impl Screen {
         if self.width == 0 || self.height == 0 {
             return;
         }
+
         if top >= bottom || bottom > self.height {
             return;
         }
+
         let lines = amount.min(bottom - top);
         let start = top * self.width;
         let end = bottom * self.width;
+
         self.cells[start..end].rotate_right(lines * self.width);
         self.cells[start..start + lines * self.width].fill(Cell::default());
     }
@@ -137,6 +150,7 @@ impl Screen {
     pub fn view_cells(&self, offset: usize) -> Vec<Cell> {
         let offset = offset.min(self.scrollback.len());
         let start = self.scrollback.len() - offset;
+
         (start..start + self.height)
             .flat_map(|row| {
                 if row < self.scrollback.len() {
