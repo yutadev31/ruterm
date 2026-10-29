@@ -824,7 +824,7 @@ mod tests {
 
     #[test]
     fn ignores_sos_pm_and_apc_strings() {
-        for introducer in [b'X', b'^', b'_'] {
+        for introducer in *b"X^_" {
             assert_eq!(
                 parse(&[
                     b'\x1b', introducer, b'a', b'\x1b', b'Q', b'b', b'\x1b', b'\\', b'Z'
@@ -836,7 +836,7 @@ mod tests {
 
     #[test]
     fn discards_oversized_sequences_and_recovers() {
-        for introducer in [b']', b'P', b'[', b'('] {
+        for introducer in *b"]P[(" {
             let mut input = vec![b'\x1b', introducer];
             input.extend(std::iter::repeat_n(
                 if introducer == b'(' { b'(' } else { b'1' },
@@ -854,7 +854,7 @@ mod tests {
 
     #[test]
     fn oversized_string_can_end_at_st_boundary() {
-        for introducer in [b']', b'P'] {
+        for introducer in *b"]P" {
             let mut input = vec![b'\x1b', introducer];
             if introducer == b'P' {
                 input.push(b'q');
