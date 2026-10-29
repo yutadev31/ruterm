@@ -6,11 +6,14 @@ pub use action::{Action, Csi, CsiParam, Dcs, Esc, Osc};
 use sequence::{CsiParser, DcsParser, EscParser, OscParser};
 use utf8::Utf8Decoder;
 
+const MAX_SEQUENCE_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Default, Clone, Copy)]
 enum State {
     #[default]
     Ground,
     Escape,
+    EscapeIgnore,
 
     CsiEntry,
     CsiParam,
@@ -19,6 +22,11 @@ enum State {
 
     OscString,
     OscEscape,
+    OscIgnore,
+    OscIgnoreEscape,
+
+    StringIgnore,
+    StringIgnoreEscape,
 
     DcsEntry,
     DcsParam,
@@ -37,6 +45,7 @@ pub struct Parser {
     csi: CsiParser,
     osc: OscParser,
     dcs: DcsParser,
+    sequence_bytes: usize,
 }
 
 impl Parser {
@@ -52,14 +61,48 @@ impl Parser {
     }
 
     fn advance_byte(&mut self, byte: u8) -> Option<Action> {
+        if !matches!(self.state, State::Ground) {
+            self.sequence_bytes = self.sequence_bytes.saturating_add(1);
+            if self.sequence_bytes > MAX_SEQUENCE_BYTES {
+                self.ignore_oversized_sequence();
+            }
+        }
+
+        if matches!(byte, 0x18 | 0x1a) && !matches!(self.state, State::Ground) {
+            self.state = State::Ground;
+            return None;
+        }
+
+        if byte == 0x1b
+            && matches!(
+                self.state,
+                State::Escape
+                    | State::EscapeIgnore
+                    | State::CsiEntry
+                    | State::CsiParam
+                    | State::CsiIntermediate
+                    | State::CsiIgnore
+            )
+        {
+            self.esc.reset();
+            self.sequence_bytes = 0;
+            self.state = State::Escape;
+            return None;
+        }
+
         match self.state {
             State::Ground => self.advance_ground(byte),
             State::Escape => self.advance_escape(byte),
+            State::EscapeIgnore => self.advance_escape_ignore(byte),
             State::CsiEntry | State::CsiParam => self.advance_csi(byte),
             State::CsiIntermediate => self.advance_csi_intermediate(byte),
             State::CsiIgnore => self.advance_csi_ignore(byte),
             State::OscString => self.advance_osc_string(byte),
             State::OscEscape => self.advance_osc_escape(byte),
+            State::OscIgnore => self.advance_osc_ignore(byte),
+            State::OscIgnoreEscape => self.advance_osc_ignore_escape(byte),
+            State::StringIgnore => self.advance_string_ignore(byte),
+            State::StringIgnoreEscape => self.advance_string_ignore_escape(byte),
             State::DcsEntry | State::DcsParam => self.advance_dcs_header(byte),
             State::DcsIntermediate => self.advance_dcs_intermediate(byte),
             State::DcsIgnore => self.advance_dcs_ignore(byte),
@@ -69,14 +112,49 @@ impl Parser {
         }
     }
 
+    fn ignore_oversized_sequence(&mut self) {
+        self.state = match self.state {
+            State::Escape => {
+                self.esc.reset();
+                State::EscapeIgnore
+            }
+            State::CsiEntry | State::CsiParam | State::CsiIntermediate => {
+                self.csi.reset();
+                State::CsiIgnore
+            }
+            State::OscString => {
+                self.osc.reset();
+                State::OscIgnore
+            }
+            State::OscEscape => {
+                self.osc.reset();
+                State::OscIgnoreEscape
+            }
+            State::DcsEntry | State::DcsParam | State::DcsIntermediate | State::DcsString => {
+                self.dcs.reset();
+                State::DcsIgnore
+            }
+            State::DcsEscape => {
+                self.dcs.reset();
+                State::DcsIgnoreEscape
+            }
+            state => state,
+        };
+    }
+
     fn advance_ground(&mut self, byte: u8) -> Option<Action> {
         match byte {
+            // ESC
             0x1b => {
+                self.utf8.reset();
                 self.esc.reset();
+                self.sequence_bytes = 0;
                 self.state = State::Escape;
             }
 
+            // C0 Control
             0x00..=0x1f | 0x7f => {
+                self.utf8.reset();
                 return Some(Action::Control(byte));
             }
 
@@ -93,21 +171,26 @@ impl Parser {
     fn advance_escape(&mut self, byte: u8) -> Option<Action> {
         match byte {
             // CSI
-            b'[' => {
+            b'[' if self.esc.is_empty() => {
                 self.csi.reset();
                 self.state = State::CsiEntry;
             }
 
             // OSC
-            b']' => {
+            b']' if self.esc.is_empty() => {
                 self.osc.reset();
                 self.state = State::OscString;
             }
 
             // DCS
-            b'P' => {
+            b'P' if self.esc.is_empty() => {
                 self.dcs.reset();
                 self.state = State::DcsEntry;
+            }
+
+            // String Ignore
+            b'X' | b'^' | b'_' if self.esc.is_empty() => {
+                self.state = State::StringIgnore;
             }
 
             // ESC
@@ -122,6 +205,13 @@ impl Parser {
             _ => {}
         }
 
+        None
+    }
+
+    fn advance_escape_ignore(&mut self, byte: u8) -> Option<Action> {
+        if (0x30..=0x7e).contains(&byte) {
+            self.state = State::Ground;
+        }
         None
     }
 
@@ -233,11 +323,46 @@ impl Parser {
         self.osc.build().map(Action::Osc)
     }
 
+    fn advance_osc_ignore(&mut self, byte: u8) -> Option<Action> {
+        match byte {
+            0x07 => self.state = State::Ground,
+            0x1b => self.state = State::OscIgnoreEscape,
+            _ => {}
+        }
+        None
+    }
+
+    fn advance_osc_ignore_escape(&mut self, byte: u8) -> Option<Action> {
+        self.state = match byte {
+            b'\\' | 0x07 => State::Ground,
+            0x1b => State::OscIgnoreEscape,
+            _ => State::OscIgnore,
+        };
+        None
+    }
+
+    fn advance_string_ignore(&mut self, byte: u8) -> Option<Action> {
+        if byte == 0x1b {
+            self.state = State::StringIgnoreEscape;
+        }
+        None
+    }
+
+    fn advance_string_ignore_escape(&mut self, byte: u8) -> Option<Action> {
+        self.state = match byte {
+            b'\\' => State::Ground,
+            0x1b => State::StringIgnoreEscape,
+            _ => State::StringIgnore,
+        };
+        None
+    }
+
     fn advance_dcs_header(&mut self, byte: u8) -> Option<Action> {
         match byte {
             0x18 | 0x1a => self.state = State::Ground,
             0x1b => {
                 self.esc.reset();
+                self.sequence_bytes = 0;
                 self.state = State::Escape;
             }
             b'0'..=b'9' => {
@@ -278,6 +403,7 @@ impl Parser {
             0x18 | 0x1a => self.state = State::Ground,
             0x1b => {
                 self.esc.reset();
+                self.sequence_bytes = 0;
                 self.state = State::Escape;
             }
             0x30..=0x3f => self.state = State::DcsIgnore,
@@ -609,5 +735,137 @@ mod tests {
     fn ignores_invalid_dcs_until_st_and_recovers_after_cancel() {
         assert_eq!(parse(b"\x1bP1?qa\x1b\\B"), vec![Action::Print('B')]);
         assert_eq!(parse(b"\x1bPqabc\x18C"), vec![Action::Print('C')]);
+    }
+
+    #[test]
+    fn restarts_or_cancels_csi() {
+        assert_eq!(
+            parse(b"\x1b[1\x1b[31mA"),
+            vec![
+                Action::Csi(Csi {
+                    private: None,
+                    params: vec![CsiParam {
+                        subparams: vec![Some(31)]
+                    }],
+                    intermediates: vec![],
+                    final_byte: b'm',
+                }),
+                Action::Print('A'),
+            ]
+        );
+        for cancel in [0x18, 0x1a] {
+            assert_eq!(
+                parse(&[b'\x1b', b'[', b'1', cancel, b'A']),
+                vec![Action::Print('A')]
+            );
+        }
+    }
+
+    #[test]
+    fn cancels_osc() {
+        for cancel in [0x18, 0x1a] {
+            assert_eq!(
+                parse(&[b'\x1b', b']', b'0', b';', b'x', cancel, b'A']),
+                vec![Action::Print('A')]
+            );
+        }
+    }
+
+    #[test]
+    fn resets_incomplete_utf8_on_control_and_resynchronizes() {
+        assert_eq!(
+            parse(b"\xe2\x1b[31mABC"),
+            vec![
+                Action::Csi(Csi {
+                    private: None,
+                    params: vec![CsiParam {
+                        subparams: vec![Some(31)]
+                    }],
+                    intermediates: vec![],
+                    final_byte: b'm',
+                }),
+                Action::Print('A'),
+                Action::Print('B'),
+                Action::Print('C'),
+            ]
+        );
+        assert_eq!(
+            parse(b"\xe2ABC"),
+            vec![Action::Print('A'), Action::Print('B'), Action::Print('C')]
+        );
+    }
+
+    #[test]
+    fn new_escape_discards_old_intermediates() {
+        assert_eq!(
+            parse(b"\x1b(\x1b7"),
+            vec![Action::Esc(Esc {
+                intermediates: [0, 0],
+                intermediate_len: 0,
+                final_byte: b'7',
+            })]
+        );
+    }
+
+    #[test]
+    fn escape_introducers_only_apply_without_intermediates() {
+        assert_eq!(
+            parse(b"\x1b([A"),
+            vec![
+                Action::Esc(Esc {
+                    intermediates: [b'(', 0],
+                    intermediate_len: 1,
+                    final_byte: b'[',
+                }),
+                Action::Print('A'),
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_sos_pm_and_apc_strings() {
+        for introducer in [b'X', b'^', b'_'] {
+            assert_eq!(
+                parse(&[
+                    b'\x1b', introducer, b'a', b'\x1b', b'Q', b'b', b'\x1b', b'\\', b'Z'
+                ]),
+                vec![Action::Print('Z')]
+            );
+        }
+    }
+
+    #[test]
+    fn discards_oversized_sequences_and_recovers() {
+        for introducer in [b']', b'P', b'[', b'('] {
+            let mut input = vec![b'\x1b', introducer];
+            input.extend(std::iter::repeat_n(
+                if introducer == b'(' { b'(' } else { b'1' },
+                MAX_SEQUENCE_BYTES,
+            ));
+            match introducer {
+                b']' => input.extend_from_slice(b"\x07Z"),
+                b'P' => input.extend_from_slice(b"\x1b\\Z"),
+                b'[' => input.extend_from_slice(b"mZ"),
+                _ => input.extend_from_slice(b"AZ"),
+            }
+            assert_eq!(parse(&input), vec![Action::Print('Z')]);
+        }
+    }
+
+    #[test]
+    fn oversized_string_can_end_at_st_boundary() {
+        for introducer in [b']', b'P'] {
+            let mut input = vec![b'\x1b', introducer];
+            if introducer == b'P' {
+                input.push(b'q');
+            }
+            let header_len = if introducer == b'P' { 2 } else { 1 };
+            input.extend(std::iter::repeat_n(
+                b'a',
+                MAX_SEQUENCE_BYTES - header_len - 1,
+            ));
+            input.extend_from_slice(b"\x1b\\Z");
+            assert_eq!(parse(&input), vec![Action::Print('Z')]);
+        }
     }
 }

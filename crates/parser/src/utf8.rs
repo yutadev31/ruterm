@@ -7,6 +7,10 @@ pub struct Utf8Decoder {
 
 impl Utf8Decoder {
     pub fn decode(&mut self, byte: u8) -> Option<char> {
+        if self.len != 0 && !(0x80..=0xbf).contains(&byte) {
+            self.reset();
+        }
+
         if self.len == 0 {
             let Some(expected) = utf8_len(byte) else {
                 return Some('\u{fffd}');
@@ -34,7 +38,7 @@ impl Utf8Decoder {
         Some(ch)
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.len = 0;
         self.expected = 0;
     }

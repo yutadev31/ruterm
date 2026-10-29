@@ -14,6 +14,10 @@ impl EscParser {
         self.intermediates.push(byte);
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.intermediates.is_empty()
+    }
+
     pub(crate) fn build(&self, final_byte: u8) -> Option<Esc> {
         let intermediate_len = self.intermediates.len();
         if intermediate_len > 2 {
@@ -22,6 +26,7 @@ impl EscParser {
 
         let mut intermediates = [0; 2];
         intermediates[..intermediate_len].copy_from_slice(&self.intermediates);
+
         Some(Esc {
             intermediates,
             intermediate_len,
@@ -54,6 +59,7 @@ impl CsiParser {
 
     pub(crate) fn push_digit(&mut self, byte: u8) {
         let digit = u16::from(byte - b'0');
+
         self.current_param = Some(
             self.current_param
                 .unwrap_or(0)
@@ -78,6 +84,7 @@ impl CsiParser {
     pub(crate) fn build(&self, final_byte: u8) -> Csi {
         let mut params = Vec::new();
         let mut subparams = Vec::new();
+
         for (index, value) in self.params.iter().copied().enumerate() {
             if index > 0 && self.separators.get(index - 1) == Some(&b';') {
                 params.push(CsiParam { subparams });
@@ -85,9 +92,11 @@ impl CsiParser {
             }
             subparams.push(value);
         }
+
         if !subparams.is_empty() {
             params.push(CsiParam { subparams });
         }
+
         Csi {
             private: self.private,
             params,
@@ -115,6 +124,7 @@ impl DcsParser {
         if has_param {
             self.header.finish_param();
         }
+
         self.final_byte = byte;
     }
 
@@ -152,6 +162,7 @@ impl OscParser {
         let (command, rest) = self.data.split_at(separator);
         let data = &rest[1..];
         let command = std::str::from_utf8(command).ok()?.parse().ok()?;
+
         Some(Osc {
             command,
             data: data.to_vec(),
