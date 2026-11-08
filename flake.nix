@@ -1,77 +1,29 @@
 {
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
-    rust-overlay.url = "github:oxalica/rust-overlay";
-  };
+  inputs.rustdev-nix.url = "github:yutadev31/rustdev-nix";
 
   outputs =
-    {
-      self,
-      nixpkgs,
-      flake-utils,
-      rust-overlay,
-    }:
-    flake-utils.lib.eachDefaultSystem (
-      system:
-      let
-        pkgs = import nixpkgs {
-          inherit system;
-          overlays = [ rust-overlay.overlays.default ];
-        };
+    inputs:
+    inputs.rustdev-nix.lib.mkFlake {
+      inherit inputs;
+      src = ./.;
 
-        rust = pkgs.rust-bin.stable.latest.default.override {
-          extensions = [
-            "rust-src"
-            "rust-analyzer"
-          ];
-        };
+      packageAttrs = { pkgs, ... }: {
+        postInstall = ''
+          wrapProgram $out/bin/ruterm-desktop --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.fontconfig ]}
+        '';
 
-        devTools = with pkgs; [
-          rust
-          tombi
-          nixd
-          nixfmt
-          typos-lsp
+        nativeBuildInputs = [
+          pkgs.pkg-config
+          pkgs.makeWrapper
         ];
 
-        nativeBuildInputs = with pkgs; [
-          pkg-config
-          makeWrapper
+        buildInputs = [
+          pkgs.wayland
+          pkgs.libxkbcommon
+          pkgs.libGL
+          pkgs.vulkan-loader
+          pkgs.fontconfig
         ];
-
-        buildInputs = with pkgs; [
-          wayland
-          libxkbcommon
-          libGL
-          vulkan-loader
-          fontconfig
-        ];
-
-        ruterm = pkgs.rustPlatform.buildRustPackage {
-          pname = "ruterm";
-          version = "0.1.0";
-          src = ./.;
-
-          cargoLock.lockFile = ./Cargo.lock;
-
-          inherit nativeBuildInputs buildInputs;
-          postInstall = ''
-            wrapProgram $out/bin/ruterm-desktop --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.fontconfig ]}
-          '';
-        };
-      in
-      {
-        packages = {
-          inherit ruterm;
-          default = ruterm;
-        };
-
-        devShells.default = pkgs.mkShell {
-          nativeBuildInputs = nativeBuildInputs ++ devTools;
-          inherit buildInputs;
-          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath buildInputs;
-        };
-      }
-    );
+      };
+    };
 }
