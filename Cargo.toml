@@ -18,9 +18,9 @@ nix = "0.31.3"
 ruterm-core.path = "crates/core"
 ruterm-parser.path = "crates/parser"
 ruterm-pty.path = "crates/pty"
-toml = "0.8.23"
+toml = "1.2.0"
 unicode-width = "0.2.3"
-wgpu = "24.0.5"
+wgpu = "30.0.1"
 winit = "0.30.13"
 
 [profile.dev]
